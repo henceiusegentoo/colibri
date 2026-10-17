@@ -51,8 +51,6 @@ DEFAULT_CORS_ORIGINS = (
     "http://localhost:8000",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
-    "http://tauri.localhost",
-    "tauri://localhost",
 )
 
 
@@ -251,6 +249,9 @@ _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.D
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
+# Gemma answers the prompt-injected format with <name>value</name> instead of
+# <arg_key>name</arg_key><arg_value>value</arg_value>; accept that as a fallback.
+_KV_RE   = re.compile(r"<([A-Za-z_][A-Za-z0-9_.\-]*)>(.*?)</\1>", re.DOTALL)
 
 
 def _fallback_tool_preamble(tools):
@@ -438,6 +439,10 @@ def parse_tool_calls(reply, tools=None):
         for arg in _ARG_RE.finditer(inner):
             key, value = arg.group(1), arg.group(2)
             args[key] = _coerce_arg(value, types.get(key))
+        if not args and name_match:
+            for arg in _KV_RE.finditer(inner[name_match.end():]):
+                if arg.group(1) not in ("arg_key", "arg_value"):
+                    args[arg.group(1)] = _coerce_arg(arg.group(2), types.get(arg.group(1)))
         if not args and _SALVAGE:
             rest = inner[name_match.end():] if name_match else ""
             payload = _TAG_RE.sub("", rest).strip()

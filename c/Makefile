@@ -1231,7 +1231,8 @@ glm53$(EXE): glm53.c decode_batch.h pin_pool.h cli_args.h st.h json.h stop_ids.h
 kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
-GEMMA4_SRCS = gemma4_backend.c gemma4_gguf.c gemma4_model.c gemma4_sampling.c gemma4_tokenizer.c gemma4_tools.c gemma4_vision.c gemma4_cuda_stub.c
+GEMMA4_CORE_SRCS = gemma4_backend.c gemma4_gguf.c gemma4_model.c gemma4_sampling.c gemma4_tokenizer.c gemma4_tools.c gemma4_vision.c
+GEMMA4_SRCS = $(GEMMA4_CORE_SRCS) gemma4_cuda_stub.c
 GEMMA4_HDRS = gemma4_backend.h gemma4_gguf.h gemma4_model.h gemma4_sampling.h gemma4_tokenizer.h gemma4_tools.h gemma4_vision.h gemma4_cuda.h model.h json.h
 GEMMA4_PNG_CFLAGS  := $(if $(IS_WIN),,$(shell pkg-config --cflags libpng 2>/dev/null))
 GEMMA4_PNG_LIBS    := $(if $(IS_WIN),,$(shell pkg-config --libs libpng 2>/dev/null))
@@ -1242,10 +1243,27 @@ GEMMA4_CODEC_FLAGS := $(if $(GEMMA4_PNG_LIBS),-DCOLI_GEMMA4_LIBPNG=1 $(GEMMA4_PN
 GEMMA4_CPPFLAGS = -I.
 GEMMA4_LIBS = $(if $(IS_WIN),-lwindowscodecs -lole32,$(GEMMA4_PNG_LIBS) $(GEMMA4_JPEG_LIBS))
 
-gemma4$(EXE): gemma4.c gemma4_backend.h gemma4_model.h gemma4_sampling.h \
+# CUDA=1: the engine links gemma4_cuda.o (nvcc, see below) instead of the no-op
+# stub. Gemma needs only cudart; the generic CUDA link line also names cuBLAS,
+# which this engine never calls, so it is filtered out rather than required.
+ifeq ($(CUDA),1)
+GEMMA4_GPU_OBJ   = gemma4_cuda.o
+GEMMA4_GPU_SRCS  =
+GEMMA4_LDFLAGS   = $(filter-out -lcublasLt -lcublas,$(LDFLAGS))
+else
+GEMMA4_GPU_OBJ   =
+GEMMA4_GPU_SRCS  = gemma4_cuda_stub.c
+GEMMA4_LDFLAGS   = $(LDFLAGS)
+endif
+
+gemma4_cuda.o: gemma4_cuda.cu gemma4_cuda.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -I. -c gemma4_cuda.cu -o $@
+
+gemma4$(EXE): gemma4.c gemma4_backend.h gemma4_cuda.h gemma4_model.h gemma4_sampling.h \
 	gemma4_tokenizer.h gemma4_tools.h gemma4_vision.h grammar.h schema_gbnf.h \
-	$(GEMMA4_SRCS) $(GEMMA4_HDRS)
-	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) gemma4.c $(GEMMA4_SRCS) -o gemma4$(EXE) $(LDFLAGS) $(GEMMA4_LIBS)
+	$(GEMMA4_SRCS) $(GEMMA4_HDRS) $(GEMMA4_GPU_OBJ)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) gemma4.c $(GEMMA4_CORE_SRCS) $(GEMMA4_GPU_SRCS) $(GEMMA4_GPU_OBJ) -o gemma4$(EXE) $(GEMMA4_LDFLAGS) $(GEMMA4_LIBS)
 
 ifneq ($(EXE),)
 .PHONY: gemma4
@@ -2070,6 +2088,10 @@ tests/test_gemma4_tools$(EXE): tests/test_gemma4_tools.c $(GEMMA4_SRCS) $(GEMMA4
 tests/test_gemma4_sampling$(EXE): tests/test_gemma4_sampling.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
 	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
 
+# GPU-vs-CPU kernel and VRAM-cache checks; meaningful only with CUDA=1.
+tests/test_gemma4_cuda$(EXE): tests/test_gemma4_cuda.c $(GEMMA4_CORE_SRCS) $(GEMMA4_HDRS) $(GEMMA4_GPU_OBJ)
+	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) tests/test_gemma4_cuda.c $(GEMMA4_CORE_SRCS) $(GEMMA4_GPU_SRCS) $(GEMMA4_GPU_OBJ) -o $@ $(GEMMA4_LDFLAGS) $(GEMMA4_LIBS)
+
 tests/test_gemma4_vision$(EXE): tests/test_gemma4_vision.c $(GEMMA4_SRCS) $(GEMMA4_HDRS)
 	$(CC) $(CFLAGS) $(GEMMA4_CPPFLAGS) $(GEMMA4_CODEC_FLAGS) $< $(GEMMA4_SRCS) -o $@ $(LDFLAGS) $(GEMMA4_LIBS)
 
@@ -2154,7 +2176,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) gemma4$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2168,6 +2190,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
+	$(INSTALL) -m 755 gemma4$(EXE) $(DESTDIR)$(LIBEXECDIR)/gemma4$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi

@@ -127,6 +127,14 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
             COLI_SEGMENT_FIXTURE_VISION_TOWER,
         6, 8, 4, 64, UINT32_C(0x44533431),
     },
+    {
+        "gemma4", "Gemma 4 26B-A4B", "fixture/gemma4-kv-sliding-v1",
+        "global-attention KV (5 layers) + sliding-window KV ring (25 layers)",
+        "tools/make_gemma4_tiny.py",
+        COLI_SEGMENT_FIXTURE_KV |
+            COLI_SEGMENT_FIXTURE_SLIDING_RING,
+        2, 8, 6, 64, UINT32_C(0x47454d34),
+    },
 };
 
 static int fail(char *error, size_t error_size, const char *message) {
@@ -378,6 +386,7 @@ DECLARE_OPEN_WRAPPER(qwen36, 5)
 DECLARE_OPEN_WRAPPER(qwen38, 6)
 DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
 DECLARE_OPEN_WRAPPER(deepseek_v41, 8)
+DECLARE_OPEN_WRAPPER(gemma4, 9)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -404,6 +413,7 @@ static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(qwen38),
     FIXTURE_ADAPTER(deepseek_v4),
     FIXTURE_ADAPTER(deepseek_v41),
+    FIXTURE_ADAPTER(gemma4),
 };
 
 int coli_segment_conformance_register_fixtures(void) {

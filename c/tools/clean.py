@@ -26,7 +26,7 @@ FILES = [
     "gemma4", "gemma4.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
-    "backend_cuda.o", "backend_loader.o",
+    "backend_cuda.o", "backend_loader.o", "gemma4_cuda.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",

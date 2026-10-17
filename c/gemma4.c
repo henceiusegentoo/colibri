@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "gemma4_backend.h"
+#include "gemma4_cuda.h"
 #include "gemma4_model.h"
 #include "gemma4_sampling.h"
 #include "gemma4_tokenizer.h"
@@ -22,9 +23,123 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+/*
+ * Launcher/gateway contract: `coli` hands every engine SNAP=<model directory>.
+ * For Gemma that directory holds the GGUF (model.gguf, or the only *.gguf in
+ * it) and the expert manifest (packed/manifest.json, or manifest.json at the
+ * top level). A direct path to a .gguf file is still accepted, in which case
+ * GEMMA4_PACKED must name the manifest directory as before.
+ */
+static int serve_is_directory(const char *path) {
+#ifdef _WIN32
+    DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
+#endif
+}
+
+static int serve_file_exists(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    fclose(file);
+    return 1;
+}
+
+static int serve_find_gguf(const char *directory, char *result, size_t capacity) {
+    char candidate[4096];
+    if (snprintf(candidate, sizeof(candidate), "%s/model.gguf", directory) <
+            (int)sizeof(candidate) && serve_file_exists(candidate)) {
+        if (strlen(candidate) + 1 > capacity) return -1;
+        memcpy(result, candidate, strlen(candidate) + 1);
+        return 0;
+    }
+#ifndef _WIN32
+    {
+        DIR *handle = opendir(directory);
+        struct dirent *entry;
+        int found = 0;
+        if (!handle) return -1;
+        while ((entry = readdir(handle)) != NULL) {
+            size_t length = strlen(entry->d_name);
+            if (length > 5 && !strcmp(entry->d_name + length - 5, ".gguf") &&
+                strncmp(entry->d_name, "mmproj", 6) != 0) {
+                if (found++) { closedir(handle); return -1; }   /* ambiguous */
+                if (snprintf(result, capacity, "%s/%s", directory,
+                             entry->d_name) >= (int)capacity) {
+                    closedir(handle);
+                    return -1;
+                }
+            }
+        }
+        closedir(handle);
+        return found == 1 ? 0 : -1;
+    }
+#else
+    return -1;
+#endif
+}
+
+static int serve_resolve_snap(const char *snap, const char *packed_env,
+                              char *gguf_path, size_t gguf_capacity,
+                              char *packed_path, size_t packed_capacity) {
+    char manifest[4096];
+    if (!snap) return -1;
+    if (!serve_is_directory(snap)) {
+        if (!packed_env || strlen(snap) + 1 > gguf_capacity ||
+            strlen(packed_env) + 1 > packed_capacity) return -1;
+        memcpy(gguf_path, snap, strlen(snap) + 1);
+        memcpy(packed_path, packed_env, strlen(packed_env) + 1);
+        return 0;
+    }
+    if (serve_find_gguf(snap, gguf_path, gguf_capacity) != 0) return -1;
+    if (packed_env && *packed_env) {
+        if (strlen(packed_env) + 1 > packed_capacity) return -1;
+        memcpy(packed_path, packed_env, strlen(packed_env) + 1);
+        return 0;
+    }
+    if (snprintf(manifest, sizeof(manifest), "%s/packed/manifest.json", snap) <
+            (int)sizeof(manifest) && serve_file_exists(manifest))
+        return snprintf(packed_path, packed_capacity, "%s/packed", snap) <
+               (int)packed_capacity ? 0 : -1;
+    if (snprintf(manifest, sizeof(manifest), "%s/manifest.json", snap) <
+            (int)sizeof(manifest) && serve_file_exists(manifest))
+        return snprintf(packed_path, packed_capacity, "%s", snap) <
+               (int)packed_capacity ? 0 : -1;
+    return -1;
+}
+
+/*
+ * GPU selection for serving. GEMMA4_CUDA_DEVICE wins; otherwise `coli --gpu`
+ * arrives as COLI_CUDA=1 (+ COLI_GPUS=<first device>,...) and COLI_CUDA=0 forces
+ * the CPU path.
+ */
+static const char *serve_cuda_device_text(char *buffer, size_t capacity) {
+    const char *explicit_device = getenv("GEMMA4_CUDA_DEVICE");
+    const char *enabled = getenv("COLI_CUDA");
+    const char *devices = getenv("COLI_GPUS");
+    size_t length = 0;
+    if (explicit_device && *explicit_device) return explicit_device;
+    if (!enabled || strcmp(enabled, "1") != 0) return NULL;
+    if (devices) while (devices[length] >= '0' && devices[length] <= '9') ++length;
+    if (!length || length + 1 > capacity) length = 0;
+    if (!length) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+    } else {
+        memcpy(buffer, devices, length);
+        buffer[length] = '\0';
+    }
+    return buffer;
+}
 
 static void usage(const char *program) {
     fprintf(stderr,
@@ -651,6 +766,27 @@ static int capture_token_piece(const coli_gemma4_tokenizer *tokenizer,
 
 static void report_expert_cache(const coli_gemma4_backend *backend) {
     coli_gemma4_cache_stats stats;
+    if (backend && backend->cuda) {
+        uint32_t slots = 0, resident = 0;
+        unsigned long long hits = 0, misses = 0, evictions = 0;
+        uint64_t h, m, e;
+        coli_gemma4_cuda_expert_cache_stats(backend->cuda, &slots, &resident, &h, &m, &e);
+        hits = h; misses = m; evictions = e;
+        if (slots)
+            fprintf(stderr,
+                    "vram expert cache: slots=%u resident=%u hits=%llu misses=%llu "
+                    "evictions=%llu hit-rate=%.1f%% dense=%.0f MiB "
+                    "io-wait=%.2fs expert-path=%.2fs\n",
+                    slots, resident, hits, misses, evictions,
+                    hits + misses ? 100.0 * (double)hits / (double)(hits + misses) : 0.0,
+                    (double)coli_gemma4_cuda_dense_bytes() / 1048576.0,
+                    backend->load_seconds, backend->gpu_seconds);
+    }
+    {
+        double attention = 0.0, complete = 0.0;
+        coli_gemma4_model_profile(&attention, &complete);
+        fprintf(stderr, "phase time: attention=%.2fs layer-rest=%.2fs\n", attention, complete);
+    }
     coli_gemma4_cache_get_stats(backend, &stats);
     if (!stats.capacity) return;
     fprintf(stderr,
@@ -658,7 +794,7 @@ static void report_expert_cache(const coli_gemma4_backend *backend) {
             "pin-hits=%llu misses=%llu preloads=%llu prefetch=%llu/%llu "
             "lookahead=%llu/%llu match=%llu/%llu "
             "evictions=%llu promotions=%llu "
-            "loaded=%.1f MiB\n",
+            "loaded=%.1f MiB disk-read=%.2fs expert-path=%.2fs\n",
             stats.capacity, stats.resident, stats.pinned_capacity,
             (unsigned long long)stats.hits,
             (unsigned long long)stats.pinned_hits,
@@ -672,7 +808,7 @@ static void report_expert_cache(const coli_gemma4_backend *backend) {
             (unsigned long long)stats.lookahead_selected,
             (unsigned long long)stats.evictions,
             (unsigned long long)stats.promotions,
-            (double)stats.bytes_loaded / (1024.0 * 1024.0));
+            (double)stats.bytes_loaded / (1024.0 * 1024.0), stats.load_seconds, stats.gpu_seconds);
 }
 
 static int persist_expert_usage(coli_gemma4_backend *backend,
@@ -2742,10 +2878,11 @@ static int command_serve(const char *cap_text) {
     coli_gemma4_gguf gguf;
     coli_gemma4_tokenizer tokenizer;
     coli_gemma4_backend gemma;
-    const char *model_path = getenv("SNAP");
-    const char *packed_dir = getenv("GEMMA4_PACKED");
+    char gguf_buffer[4096], packed_buffer[4096], cuda_buffer[16];
+    const char *model_path = NULL;
+    const char *packed_dir = NULL;
     const char *context_text = getenv("CTX");
-    const char *cuda_text = getenv("GEMMA4_CUDA_DEVICE");
+    const char *cuda_text = serve_cuda_device_text(cuda_buffer, sizeof(cuda_buffer));
     const char *kv_slots_text = getenv("KV_SLOTS");
     uint32_t cache_slots = 0, maximum_context = 4096, cuda_device = 0;
     uint32_t kv_slot_count = 1, slot_index;
@@ -2754,6 +2891,12 @@ static int command_serve(const char *cap_text) {
     memset(&gguf, 0, sizeof(gguf));
     memset(&tokenizer, 0, sizeof(tokenizer));
     memset(&gemma, 0, sizeof(gemma));
+    if (serve_resolve_snap(getenv("SNAP"), getenv("GEMMA4_PACKED"),
+                           gguf_buffer, sizeof(gguf_buffer),
+                           packed_buffer, sizeof(packed_buffer)) == 0) {
+        model_path = gguf_buffer;
+        packed_dir = packed_buffer;
+    }
     if (!model_path || !packed_dir ||
         parse_u32(cap_text, &cache_slots) != 0 ||
         (context_text && (parse_u32(context_text, &maximum_context) != 0 ||
@@ -2761,7 +2904,9 @@ static int command_serve(const char *cap_text) {
         (kv_slots_text && (parse_u32(kv_slots_text, &kv_slot_count) != 0 ||
                            !kv_slot_count || kv_slot_count > 16)) ||
         (cuda_text && parse_u32(cuda_text, &cuda_device) != 0)) {
-        fprintf(stderr, "Gemma serve requires SNAP, GEMMA4_PACKED, and valid settings\n");
+        fprintf(stderr, "Gemma serve requires SNAP=<model dir with model.gguf and "
+                        "packed/manifest.json> (or a .gguf path plus GEMMA4_PACKED) "
+                        "and valid settings\n");
         return 2;
     }
     if (!cache_slots) cache_slots = 256;

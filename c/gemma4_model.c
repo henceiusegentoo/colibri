@@ -2,6 +2,7 @@
 
 #include "gemma4_model.h"
 #include "gemma4_backend.h"
+#include "gemma4_cuda.h"
 
 #include <float.h>
 #include <math.h>
@@ -9,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static void router_error(coli_gemma4_router *router, const char *format, ...) {
     va_list arguments;
@@ -71,11 +76,21 @@ int coli_gemma4_matrix_open(coli_gemma4_matrix *matrix,
     matrix->tensor = tensor;
     matrix->input_width = (uint32_t)tensor->dims[0];
     matrix->output_width = (uint32_t)tensor->dims[1];
+    /* With a CUDA context active, keep a resident VRAM copy for matvec. The host copy
+     * stays (embedding rows are still read on the CPU) and is the fallback if the
+     * upload does not fit. */
+    if (coli_gemma4_cuda_dense_enabled())
+        matrix->cuda = coli_gemma4_cuda_matrix_upload(
+            matrix->data, (size_t)tensor->nbytes,
+            tensor->type == COLI_GGML_TYPE_Q6_K ? COLI_GEMMA4_CUDA_Q6_K
+                                                 : COLI_GEMMA4_CUDA_Q4_0,
+            matrix->output_width, matrix->input_width);
     return 0;
 }
 
 void coli_gemma4_matrix_close(coli_gemma4_matrix *matrix) {
     if (!matrix) return;
+    coli_gemma4_cuda_matrix_free(matrix->cuda);
     free(matrix->data);
     memset(matrix, 0, sizeof(*matrix));
 }
@@ -83,6 +98,9 @@ void coli_gemma4_matrix_close(coli_gemma4_matrix *matrix) {
 int coli_gemma4_matrix_matvec(const coli_gemma4_matrix *matrix,
                               const float *input, float *output) {
     if (!matrix || !matrix->data || !input || !output) return -1;
+    if (matrix->cuda &&
+        coli_gemma4_cuda_matrix_matvec(matrix->cuda, input, output) == 0)
+        return 0;
     if (matrix->tensor->type == COLI_GGML_TYPE_Q4_0)
         return coli_gemma4_q4_0_matvec(matrix->data, matrix->output_width,
                                        matrix->input_width, input, output);
@@ -1253,23 +1271,49 @@ cleanup:
     return status;
 }
 
+static double g_profile_attention, g_profile_complete;
+
+void coli_gemma4_model_profile(double *attention_seconds, double *complete_seconds) {
+    if (attention_seconds) *attention_seconds = g_profile_attention;
+    if (complete_seconds) *complete_seconds = g_profile_complete;
+}
+
+static double profile_now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+
 int coli_gemma4_decoder_layer_step(
     const coli_gemma4_decoder_layer *decoder, coli_gemma4_kv_cache *cache,
     const coli_expert_backend *experts, uint64_t position,
     const float *residual, float *output) {
     float *attention_output;
     size_t vector_bytes;
+    double t0, t1, t2;
     int status;
     if (!decoder || !cache || !experts || !residual || !output ||
         !decoder->model_width) return -1;
     vector_bytes = (size_t)decoder->model_width * sizeof(float);
     attention_output = (float *)malloc(vector_bytes);
     if (!attention_output) return -1;
+    t0 = profile_now();
     status = coli_gemma4_attention_step(
         &decoder->attention, cache, position, residual, attention_output);
+    t1 = profile_now();
     if (status == 0)
         status = decoder_layer_complete(
             decoder, experts, residual, attention_output, output);
+    t2 = profile_now();
+    g_profile_attention += t1 - t0;
+    g_profile_complete += t2 - t1;
     free(attention_output);
     return status;
 }

@@ -138,6 +138,19 @@
         "path": "tools/make_dsv41_tiny.py"
       },
       "real_adapter_required": true
+    },
+    {
+      "family_id": "gemma4",
+      "state_schema": "fixture/gemma4-kv-sliding-v1",
+      "state_components": [
+        "global_kv",
+        "sliding_kv_ring"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_gemma4_tiny.py"
+      },
+      "real_adapter_required": true
     }
   ]
 }

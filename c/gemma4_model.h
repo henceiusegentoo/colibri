@@ -23,6 +23,7 @@ typedef struct {
     uint8_t *data;
     uint32_t input_width;
     uint32_t output_width;
+    void *cuda;                 /* resident VRAM copy, or NULL (CPU copy in data) */
 } coli_gemma4_matrix;
 
 typedef struct {
@@ -196,6 +197,9 @@ int coli_gemma4_decoder_layer_noncausal(
     const coli_gemma4_decoder_layer *decoder, coli_gemma4_kv_cache *cache,
     const coli_expert_backend *experts, uint64_t start_position,
     const float *residuals, uint32_t token_count, float *outputs);
+
+/* Wall seconds spent in attention vs. the rest of the layer (dense MLP, router, experts). */
+void coli_gemma4_model_profile(double *attention_seconds, double *complete_seconds);
 
 int coli_gemma4_router_open(coli_gemma4_router *router,
                             const coli_gemma4_gguf *gguf, uint32_t layer);

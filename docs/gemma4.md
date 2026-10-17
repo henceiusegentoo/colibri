@@ -426,21 +426,10 @@ orders averaged 4.80 seconds without lookahead and 4.18 seconds with it (12.9%
 lower wall time); individual pair wins ranged from 3.1% to 20.3%, showing why
 the policy remains opt-in and measurable.
 
-The source tree includes a validated persistent-buffer CUDA Q4_0 expert kernel,
-but the focused Makefile integration in this PR builds the dependency-free CPU
-backend. Wiring the optional CUDA source into Colibri's existing platform CUDA
-build conventions is follow-up work. During development, the focused benchmark
-kept one encoded record resident in the host cache and reused CUDA allocations.
-
-On the local 4 GB Quadro P1000, CUDA averaged 1.45 ms/expert versus 1.60 ms on
-CPU (9.4% faster). Agreement was strong: maximum absolute error `4.66e-10`, RMS
-`1.25e-10`. First-call process startup and device initialization remain slower,
-so the GPU path is useful for persistent inference rather than one-shot probes.
-
-This first integration deliberately exposes Gemma through the standalone
-`gemma4` executable. Wiring it into Colibri's evolving OpenAI-compatible
-gateway and WebUI is follow-up work so that the engine implementation can be
-reviewed independently from gateway scheduling and streaming-tool changes.
+The CUDA tier is described in [Running through `coli`, and the CUDA tier](#running-through-coli-and-the-cuda-tier)
+below. The measurements in this paragraph are from the earlier per-expert-upload
+kernel on a 4 GB Quadro P1000: CUDA averaged 1.45 ms/expert versus 1.60 ms on CPU
+(9.4% faster), with maximum absolute error `4.66e-10`.
 
 The input/output boundaries can also be probed independently:
 
@@ -616,6 +605,86 @@ python tests\validate_gemma4_full.py `
   --llama-bin C:\path\to\llama.cpp\build\bin\Release `
   --chat-file C:\path\to\user-message-utf8.txt
 ```
+
+## Running through `coli`, and the CUDA tier
+
+`coli chat`, `coli serve` and `coli web` start this engine like any other family.
+The model is a directory, because `coli` expects `config.json` and `tokenizer.json`
+there; the engine itself reads the GGUF in place (weights, tokenizer and chat
+template come from the GGUF, so `tokenizer.json` only has to exist):
+
+```
+gemma-4-26B-A4B/
+  config.json           # google/gemma-4-26B-A4B-it, lets the registry recognise the family
+  tokenizer.json        # same repo; only its presence is checked
+  model.gguf            # google/gemma-4-26B-A4B-it-qat-q4_0-gguf (gemma-4-26B_q4_0-it.gguf)
+  packed/manifest.json  # python3 c/tools/make_gemma4_manifest.py model.gguf packed
+```
+
+`make_gemma4_manifest.py` describes the fused expert tensors of the GGUF in place,
+so no separate packing pass or second copy of the experts is needed. It requires
+Q4_0 experts. Then:
+
+```
+make -C c gemma4 CUDA=1 CUDA_HOME=/path/to/cuda CUDA_ARCH=sm_75   # omit CUDA=1 for CPU only
+coli serve --model gemma-4-26B-A4B --gpu 0 --ctx 4096
+```
+
+`coli --gpu none` (or `COLI_CUDA=0`) forces the CPU path. `coli run` has no Gemma
+branch yet; chat, serve and web work. The gateway renders Gemma's canonical chat
+template (checked byte for byte against the template embedded in the GGUF) and
+refuses tool declarations unless `COLI_TOOL_FALLBACK=1` is set.
+
+**What runs on the GPU.** All Q4_0 dense matrices (attention projections, dense
+MLP) and the Q6_K token embedding / LM head are uploaded once and stay in VRAM;
+a matvec ships only the activation vector. Routed experts live in a VRAM slab
+managed as an LRU of fixed-size record slots, sized from whatever VRAM the dense
+matrices left (minus `GEMMA4_CUDA_RESERVE_MB`, default 256). A layer is one input
+upload, up to top-8 expert launches that accumulate on the device, and one output
+download. Attention math, norms and the router still run on the CPU. If a matrix
+does not fit it simply stays on the CPU, so a small card degrades instead of
+failing.
+
+**Expert misses** are read straight from the GGUF with `pread`, one thread per
+missed expert, into page-locked staging buffers that the GPU copies from. The reads
+start in `prepare_layer`, right after routing, and are joined in `run_experts`, so
+they overlap the dense MLP. Reads go through the page cache by default (a warm
+cache serves repeats at memory speed); `GEMMA4_IO=direct` uses `O_DIRECT`
+instead. On the 2060 box a 48-token run took 14.2 s with direct I/O against 9.4 s
+buffered, because the OS cache otherwise holds most of the 14.4 GB file.
+
+| Variable | Meaning |
+|---|---|
+| `GEMMA4_CUDA_DEVICE` | CUDA device index (overrides `coli --gpu`) |
+| `GEMMA4_CUDA_DENSE=0` | keep dense matrices on the CPU |
+| `GEMMA4_CUDA_EXPERT_MB` | cap the VRAM expert slab; `0` disables it |
+| `GEMMA4_CUDA_RESERVE_MB` | VRAM left free for the runtime (default 256) |
+| `GEMMA4_IO=direct` | bypass the page cache for expert reads |
+
+`gemma4` reports the VRAM hit rate, disk wait and per-phase time on exit.
+
+**Validation.** `tests/test_gemma4_cuda.c` compares the Q4_0 and Q6_K kernels and a
+randomised LRU expert-cache schedule (1,200 launches over 20 slots, constant
+eviction) against the CPU reference: worst error 8e-6 x RMS. The tiny-fixture
+oracle (`tests/test_gemma4_tiny.py ... --cuda-device 0`) is token-exact at cache
+sizes 1, 2 and 8 with logits within 6e-8. On the real model, a 10-token prompt gives
+CPU-vs-GPU final logits with cosine 0.9999999, max |diff| 7e-5 and KL 8e-11, and
+the same top-10 order. Results agree to float rounding, not bit for bit, because
+the GPU sums in a different order.
+
+**Measured on an RTX 2060 (6 GB), Ryzen 5 1600X, 15 GB RAM, NVMe** (one machine,
+single runs, greedy decoding, so treat the numbers as indicative):
+
+| Setup | Throughput |
+|---|---|
+| CPU only, `--expert-cache 512` | about 1 token/s (76 evaluations in 73 s) |
+| CUDA, resident dense + VRAM expert cache (1,167 slots, 1.46 GB dense) | about 7 tokens/s |
+
+The VRAM expert cache hit 78-79% on 48- and 200-token generations; the first request
+after start-up is slower (4.8 tokens/s) while the OS cache fills. Of a 200-token
+run (33 s), attention took 8.6 s, the rest of the layer 20.7 s, of which the
+expert path was 15.4 s and 9.6 s of that was waiting for disk reads. Disk and CPU
+attention are the remaining limits, not the GPU kernels.
 
 ## Real-model validation
 

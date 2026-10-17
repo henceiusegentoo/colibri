@@ -1354,6 +1354,72 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+_GEMMA4_THOUGHT = re.compile(r"<\|channel>.*?<channel\|>", re.DOTALL)
+
+
+def render_chat_gemma4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Text-only subset of Gemma 4's canonical chat template (the one embedded in the
+    GGUF, 2026-07-09): <bos>, an optional <|turn>system block (which carries the
+    <|think|> switch), <|turn>user / <|turn>model frames each closed by <turn|>\\n,
+    then the generation prompt. With thinking off the template pre-closes an empty
+    thought channel right after `<|turn>model\\n`; with it on the model opens its own.
+    The serve path adds no BOS itself, so `<bos>` is part of the rendered prompt."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the Gemma 4 engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
+    system_text = ""
+    body = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        allowed = ("system", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "system" and index == 0:
+            system_text = text.strip()
+            continue
+        if role == "system":
+            role = "user"          # the template only knows a leading system turn
+        if role == "tool":
+            body.append(("user", _fallback_tool_result(message, index)))
+            continue
+        if role == "assistant":
+            if _TOOL_FALLBACK:
+                text += _fallback_tool_calls(message.get("tool_calls"), index)
+            text = _GEMMA4_THOUGHT.sub("", text)
+            body.append(("model", text.strip()))
+        else:
+            body.append(("user", text.strip()))
+    parts = ["<bos>"]
+    if tools and _TOOL_FALLBACK:
+        system_text = (system_text + "\n" if system_text else "") + _fallback_tool_preamble(tools)
+    if enable_thinking or system_text:
+        parts.append("<|turn>system\n")
+        if enable_thinking:
+            parts.append("<|think|>\n")
+        parts.append(system_text)
+        parts.append("<turn|>\n")
+    for role, text in body:
+        parts.append(f"<|turn>{role}\n{text}<turn|>\n")
+    parts.append("<|turn>model\n")
+    if not enable_thinking:
+        parts.append("<|channel>thought\n<channel|>")
+    return "".join(parts)
+
+
 # Qwen3.8 declares and emits tool calls in an XML-ish form of its own, not the
 # JSON block GLM uses and not DeepSeek's DSML -- so it needs its own renderer and
 # its own parser. Both sides are transcribed from chat_template.jinja rather than
@@ -2319,7 +2385,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_dsv41 if ARCH == "deepseek_v41" else
-                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+                render_chat_olmoe if ARCH == "olmoe" else
+                render_chat_gemma4 if ARCH == "gemma4" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
@@ -2346,7 +2413,9 @@ def starts_in_reasoning(enable_thinking):
     spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
     ogni caso; partire in modalita' testo perche' il client ha detto False e'
     esattamente il ragionamento incollato davanti alla risposta di #1278."""
-    return enable_thinking or ARCH == "glm53"
+    # Gemma 4's engine withholds the whole <|channel>thought ... <channel|> block from
+    # the DATA stream, so what reaches the gateway is already the answer.
+    return (enable_thinking and ARCH != "gemma4") or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:

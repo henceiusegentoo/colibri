@@ -25,7 +25,10 @@ def main():
     parser.add_argument("--exe", type=Path, default=Path("./gemma4"))
     parser.add_argument("--fixture", type=Path, default=Path("gemma4_tiny"))
     parser.add_argument("--cache", type=int, required=True)
+    parser.add_argument("--cuda-device", type=int, default=None,
+                        help="run both commands on this CUDA device (needs a CUDA=1 build)")
     args = parser.parse_args()
+    gpu = [] if args.cuda_device is None else ["--cuda-device", args.cuda_device]
     exe, fixture = args.exe.resolve(), args.fixture.resolve()
     ref = json.loads((fixture / "ref.json").read_text(encoding="utf-8"))
     model, packed = fixture / "model.gguf", fixture / "packed"
@@ -33,7 +36,7 @@ def main():
         logits_path = Path(directory) / "logits.f32"
         ranked = run([exe, "next-token", model, packed, ref["prompt"],
                       "--top", "3", "--expert-cache", args.cache,
-                      "--logits-f32", logits_path])
+                      "--logits-f32", logits_path, *gpu])
         actual = np.fromfile(logits_path, dtype="<f4")
         expected = np.asarray(ref["logits"], dtype=np.float32)
         if actual.shape != expected.shape:
@@ -47,14 +50,14 @@ def main():
                              f"{ranked.stdout}\n{ranked.stderr}")
         generated = run([exe, "generate", model, packed, ref["prompt"],
                          "--max-new", len(ref["generated_tokens"]),
-                         "--show-special", "--expert-cache", args.cache])
+                         "--show-special", "--expert-cache", args.cache, *gpu])
         marker = "generated:\n"
         if marker not in generated.stdout:
             raise SystemExit(f"generation marker missing:\n{generated.stdout}")
         text = generated.stdout.split(marker, 1)[1].splitlines()[0]
         if text != ref["generated_text"]:
             raise SystemExit(f"token stream differs: {text!r} != {ref['generated_text']!r}")
-        print(f"PASS cap={args.cache}: token-exact, logits max_abs={maximum:.7g} cosine={cosine:.9f}")
+        print(f"PASS cap={args.cache} {'cuda' + str(args.cuda_device) if gpu else 'cpu'}: token-exact, logits max_abs={maximum:.7g} cosine={cosine:.9f}")
 
 
 if __name__ == "__main__":

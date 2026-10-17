@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "json.h"
 #include "tier.h"
@@ -23,8 +24,10 @@
 #define g4_tell _ftelli64
 typedef __int64 g4_off_t;
 #else
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <unistd.h>
 #define g4_seek fseeko
 #define g4_tell ftello
 typedef off_t g4_off_t;
@@ -70,6 +73,19 @@ static void g4_set_error(coli_gemma4_backend *backend, const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(backend->last_error, sizeof(backend->last_error), fmt, args);
     va_end(args);
+}
+
+static double g4_now_seconds(void) {
+#ifdef _WIN32
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
 }
 
 static void g4_free_json(jval *value) {
@@ -517,8 +533,11 @@ fail:
     return -1;
 }
 
+static void g4_stage_destroy(coli_gemma4_backend *backend);
+
 void coli_gemma4_close(coli_gemma4_backend *backend) {
     if (!backend) return;
+    g4_stage_destroy(backend);
     coli_gemma4_cuda_destroy(backend->cuda);
     g4_prefetch_destroy(backend);
     g4_cache_clear(backend);
@@ -620,6 +639,8 @@ void coli_gemma4_cache_get_stats(const coli_gemma4_backend *backend,
     stats->evictions = backend->cache_evictions;
     stats->promotions = backend->cache_promotions;
     stats->bytes_loaded = backend->cache_bytes_loaded;
+    stats->load_seconds = backend->load_seconds;
+    stats->gpu_seconds = backend->gpu_seconds;
 }
 
 const char *coli_gemma4_last_error(const coli_gemma4_backend *backend) {
@@ -954,13 +975,41 @@ static int g4_read_header_and_payload(coli_gemma4_backend *backend,
 
 int coli_gemma4_cuda_configure(coli_gemma4_backend *backend, int device) {
     void *context = NULL;
+    uint32_t i;
+    int uniform = backend && backend->layer_count > 0;
     if (!backend || !backend->layers || device < 0) return -1;
     if (coli_gemma4_cuda_create(
             &context, device, backend->last_error,
             sizeof(backend->last_error)) != 0) return -1;
     coli_gemma4_cuda_destroy(backend->cuda);
     backend->cuda = context;
+    /* The VRAM expert cache needs one record geometry for every layer (true for
+     * Gemma 4). Otherwise the per-expert upload path is used unchanged. */
+    for (i = 1; uniform && i < backend->layer_count; ++i) {
+        const coli_gemma4_layer *a = backend->layers, *b = backend->layers + i;
+        if (a->payload_bytes != b->payload_bytes || a->model_width != b->model_width ||
+            a->expert_width != b->expert_width || a->expert_count != b->expert_count ||
+            a->component_bytes[G4_ROLE_GATE] != b->component_bytes[G4_ROLE_GATE] ||
+            a->component_bytes[G4_ROLE_UP] != b->component_bytes[G4_ROLE_UP]) uniform = 0;
+    }
+    if (uniform && backend->layers[0].payload_bytes <= SIZE_MAX) {
+        char ignored[160];
+        (void)coli_gemma4_cuda_expert_cache_configure(
+            context, backend->layer_count, backend->layers[0].expert_count,
+            (size_t)backend->layers[0].payload_bytes, backend->layers[0].model_width,
+            backend->layers[0].expert_width, 0, ignored, sizeof(ignored));
+    }
     return 0;
+}
+
+static int g4_vram_cache_active(const coli_gemma4_backend *backend) {
+#ifdef _WIN32
+    (void)backend;   /* the staged miss loader is POSIX-only for now: keep the per-expert path */
+    return 0;
+#else
+    return backend && backend->cuda &&
+           coli_gemma4_cuda_expert_cache_slots(backend->cuda) > 0;
+#endif
 }
 
 static int g4_source_path(coli_gemma4_backend *backend, char *destination,
@@ -1176,15 +1225,248 @@ static int g4_load_record(coli_gemma4_backend *backend,
                           const coli_gemma4_layer *descriptor,
                           uint32_t expert, uint8_t *payload, float *scale) {
     int read_status;
+    double started = g4_now_seconds();
     if (coli_gemma4_has_packed_layer(backend, descriptor))
         read_status = g4_read_header_and_payload(backend, descriptor,
                                                  expert, payload);
     else
         read_status = g4_read_source_payload(backend, descriptor,
                                              expert, payload);
-    if (read_status != 0) return -1;
-    return g4_read_scale(backend, descriptor, expert, scale);
+    if (read_status == 0) read_status = g4_read_scale(backend, descriptor, expert, scale);
+    backend->load_seconds += g4_now_seconds() - started;
+    return read_status == 0 ? 0 : -1;
 }
+
+/* ---- parallel miss loader (VRAM-cache mode) --------------------------------
+ * Expert misses are read straight from the source GGUF with positional reads, one
+ * thread per missed expert, into page-locked staging buffers that the GPU copies
+ * from directly. Reads start in prepare_layer (right after routing) and are joined in
+ * run_experts, so they overlap the model thread's dense MLP work. Reads go through the
+ * page cache by default (a warm cache serves repeats at memory speed); GEMMA4_IO=direct
+ * switches to O_DIRECT, which skips the cache and keeps it free for other programs. */
+#ifndef _WIN32
+typedef struct {
+    const coli_gemma4_layer *layer;
+    coli_gemma4_backend *backend;
+    uint32_t expert;
+    uint8_t *buffer;
+    uint8_t *scratch;
+    size_t scratch_bytes;
+    float scale;
+    int status;
+    int started;
+    pthread_t thread;
+} g4_stage;
+
+static int g4_io_open(coli_gemma4_backend *backend) {
+    char path[COLI_GEMMA4_PATH_MAX];
+    const char *mode;
+    int plain;
+    if (backend->plain_fd1) return 0;
+    if (g4_source_path(backend, path, sizeof(path)) != 0) return -1;
+    plain = open(path, O_RDONLY);
+    if (plain < 0) {
+        g4_set_error(backend, "cannot open source GGUF %s: %s", path, strerror(errno));
+        return -1;
+    }
+    backend->plain_fd1 = plain + 1;
+    mode = getenv("GEMMA4_IO");
+#ifdef O_DIRECT
+    if (mode && strcmp(mode, "direct") == 0) {
+        int direct = open(path, O_RDONLY | O_DIRECT);
+        if (direct >= 0) backend->direct_fd1 = direct + 1;
+    }
+#else
+    (void)mode;
+#endif
+    return 0;
+}
+
+static int g4_read_range(const coli_gemma4_backend *backend, g4_stage *stage,
+                         uint64_t offset, size_t bytes, uint8_t *destination) {
+    size_t done = 0;
+    if (backend->direct_fd1) {
+        uint64_t start = offset & ~(uint64_t)4095;
+        uint64_t end = (offset + bytes + 4095) & ~(uint64_t)4095;
+        size_t span = (size_t)(end - start), need = (size_t)(offset + bytes - start);
+        if (span > stage->scratch_bytes) return -1;
+        while (done < need) {
+            ssize_t n = pread(backend->direct_fd1 - 1, stage->scratch + done,
+                              span - done, (off_t)(start + done));
+            if (n < 0) { if (errno == EINTR) continue; return -1; }
+            if (n == 0) break;
+            done += (size_t)n;
+        }
+        if (done < need) return -1;
+        memcpy(destination, stage->scratch + (offset - start), bytes);
+        return 0;
+    }
+    while (done < bytes) {
+        ssize_t n = pread(backend->plain_fd1 - 1, destination + done, bytes - done,
+                          (off_t)(offset + done));
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+static int g4_stage_read(g4_stage *stage) {
+    const coli_gemma4_layer *layer = stage->layer;
+    const coli_gemma4_backend *backend = stage->backend;
+    uint64_t source[3];
+    uint64_t gate = layer->component_bytes[G4_ROLE_GATE];
+    uint64_t up = layer->component_bytes[G4_ROLE_UP];
+    uint64_t down = layer->component_bytes[G4_ROLE_DOWN];
+    int role;
+    for (role = 0; role < 3; ++role)
+        source[role] = layer->source_offset[role] +
+                       (uint64_t)stage->expert * layer->source_expert_stride[role] +
+                       layer->source_within_expert_offset[role];
+    if (source[G4_ROLE_UP] == source[G4_ROLE_GATE] + gate) {
+        if (g4_read_range(backend, stage, source[G4_ROLE_GATE], (size_t)(gate + up),
+                          stage->buffer) != 0) return -1;
+    } else if (g4_read_range(backend, stage, source[G4_ROLE_GATE], (size_t)gate,
+                             stage->buffer) != 0 ||
+               g4_read_range(backend, stage, source[G4_ROLE_UP], (size_t)up,
+                             stage->buffer + gate) != 0) {
+        return -1;
+    }
+    if (g4_read_range(backend, stage, source[G4_ROLE_DOWN], (size_t)down,
+                      stage->buffer + gate + up) != 0) return -1;
+    stage->scale = 1.0F;
+    if (layer->has_scale) {
+        uint8_t bytes[4];
+        uint32_t bits;
+        ssize_t n = pread(backend->plain_fd1 - 1, bytes, sizeof(bytes),
+                          (off_t)(layer->scale_offset +
+                                  (uint64_t)stage->expert * layer->scale_scalar_bytes));
+        if (n != (ssize_t)sizeof(bytes)) return -1;
+        bits = g4_load_u32(bytes);
+        memcpy(&stage->scale, &bits, sizeof(stage->scale));
+        if (!isfinite(stage->scale)) return -1;
+    }
+    return 0;
+}
+
+static void *g4_stage_thread(void *opaque) {
+    g4_stage *stage = (g4_stage *)opaque;
+    stage->status = g4_stage_read(stage);
+    return NULL;
+}
+
+static int g4_stage_join(coli_gemma4_backend *backend) {
+    g4_stage *stages = (g4_stage *)backend->stage;
+    uint32_t i;
+    int failed = 0;
+    for (i = 0; i < backend->stage_count; ++i) {
+        if (stages[i].started) {
+            pthread_join(stages[i].thread, NULL);
+            stages[i].started = 0;
+        }
+        if (stages[i].status != 0) failed = 1;
+    }
+    if (failed) {
+        g4_set_error(backend, "cannot read routed expert records from the source GGUF");
+        return -1;
+    }
+    return 0;
+}
+
+static void g4_stage_destroy(coli_gemma4_backend *backend) {
+    g4_stage *stages = (g4_stage *)backend->stage;
+    uint32_t i;
+    if (!backend) return;
+    if (stages) {
+        (void)g4_stage_join(backend);
+        for (i = 0; i < backend->stage_capacity; ++i) {
+            coli_gemma4_cuda_host_free(stages[i].buffer);
+            free(stages[i].scratch);
+        }
+        free(stages);
+    }
+    if (backend->direct_fd1) close(backend->direct_fd1 - 1);
+    if (backend->plain_fd1) close(backend->plain_fd1 - 1);
+    backend->stage = NULL;
+    backend->stage_capacity = backend->stage_count = 0;
+    backend->stage_ready = 0;
+    backend->direct_fd1 = backend->plain_fd1 = 0;
+}
+
+static int g4_stage_start(coli_gemma4_backend *backend,
+                          const coli_gemma4_layer *layer,
+                          const uint32_t *expert_ids, uint32_t count) {
+    g4_stage *stages;
+    uint32_t i;
+    backend->stage_ready = 0;
+    if (!count) {
+        backend->stage_count = 0;
+        backend->stage_layer = layer->layer;
+        backend->stage_ready = 1;
+        return 0;
+    }
+    if (g4_io_open(backend) != 0) return -1;
+    if (count > backend->stage_capacity) {
+        size_t scratch_bytes = (size_t)(layer->component_bytes[G4_ROLE_GATE] +
+                                        layer->component_bytes[G4_ROLE_UP]);
+        g4_stage *grown;
+        if ((size_t)layer->component_bytes[G4_ROLE_DOWN] > scratch_bytes)
+            scratch_bytes = (size_t)layer->component_bytes[G4_ROLE_DOWN];
+        scratch_bytes = (scratch_bytes + 2 * 4096 + 4095) / 4096 * 4096;
+        (void)g4_stage_join(backend);
+        grown = (g4_stage *)calloc(count, sizeof(*grown));
+        if (!grown) {
+            g4_set_error(backend, "out of memory allocating expert staging");
+            return -1;
+        }
+        for (i = 0; i < backend->stage_capacity; ++i)
+            grown[i] = ((g4_stage *)backend->stage)[i];
+        for (i = backend->stage_capacity; i < count; ++i) {
+            grown[i].buffer = (uint8_t *)coli_gemma4_cuda_host_alloc(
+                (size_t)layer->payload_bytes);
+            grown[i].scratch_bytes = scratch_bytes;
+            if (posix_memalign((void **)&grown[i].scratch, 4096, scratch_bytes) != 0)
+                grown[i].scratch = NULL;
+            if (!grown[i].buffer || !grown[i].scratch) {
+                backend->stage_capacity = i + 1;   /* so destroy frees what exists */
+                free(backend->stage);
+                backend->stage = grown;
+                g4_set_error(backend, "out of memory allocating expert staging buffers");
+                return -1;
+            }
+        }
+        free(backend->stage);
+        backend->stage = grown;
+        backend->stage_capacity = count;
+    }
+    stages = (g4_stage *)backend->stage;
+    for (i = 0; i < count; ++i) {
+        stages[i].backend = backend;
+        stages[i].layer = layer;
+        stages[i].expert = expert_ids[i];
+        stages[i].status = 0;
+        stages[i].started = pthread_create(&stages[i].thread, NULL,
+                                           g4_stage_thread, &stages[i]) == 0;
+        if (!stages[i].started) stages[i].status = g4_stage_read(&stages[i]);
+    }
+    backend->stage_count = count;
+    backend->stage_layer = layer->layer;
+    backend->stage_ready = 1;
+    return 0;
+}
+
+static g4_stage *g4_stage_find(coli_gemma4_backend *backend, uint32_t layer,
+                               uint32_t expert) {
+    g4_stage *stages = (g4_stage *)backend->stage;
+    uint32_t i;
+    if (!backend->stage_ready || backend->stage_layer != layer) return NULL;
+    for (i = 0; i < backend->stage_count; ++i)
+        if (stages[i].expert == expert) return stages + i;
+    return NULL;
+}
+#else
+static void g4_stage_destroy(coli_gemma4_backend *backend) { (void)backend; }
+#endif
 
 static coli_gemma4_cache_slot *g4_cache_load(
     coli_gemma4_backend *backend, const coli_gemma4_layer *descriptor,
@@ -1543,6 +1825,25 @@ static int g4_prepare_layer(void *opaque, uint32_t layer,
     uint32_t i;
     if (g4_validate_expert_ids(backend, descriptor, layer,
                                expert_ids, count) != 0) return -1;
+#ifndef _WIN32
+    if (g4_vram_cache_active(backend)) {
+        /* VRAM mode: no host cache. Resident experts are protected from eviction by
+         * the residency check; the rest are read in parallel into staging buffers
+         * while the model thread runs its dense branch. */
+        uint32_t missing[64], kept = 0;
+        if (count > 64) {
+            g4_set_error(backend, "too many routed experts for the staged loader");
+            return -1;
+        }
+        if (g4_stage_join(backend) != 0) return -1;
+        for (i = 0; i < count; ++i) {
+            g4_cache_record_access(backend, layer, expert_ids[i]);
+            if (!coli_gemma4_cuda_expert_resident(backend->cuda, layer, expert_ids[i]))
+                missing[kept++] = expert_ids[i];
+        }
+        return g4_stage_start(backend, descriptor, missing, kept);
+    }
+#endif
     if (backend->prefetch && backend->cache_capacity) {
         uint32_t missing = 0;
         if (backend->prefetch->lookahead &&
@@ -1590,6 +1891,85 @@ static int g4_prepare_layer(void *opaque, uint32_t layer,
     return 0;
 }
 
+/* One layer on the GPU: a single input upload, up to top-k expert launches that
+ * accumulate weight * expert_output on the device, one output download. VRAM-resident
+ * experts are launched without touching host memory; the rest come from the host
+ * cache (or disk) and are copied into the LRU slot on the way. */
+static int g4_run_experts_vram(coli_gemma4_backend *backend,
+                               const coli_gemma4_layer *descriptor,
+                               const uint32_t *expert_ids, const float *weights,
+                               uint32_t count, const float *input, float *output) {
+#ifdef _WIN32
+    (void)descriptor; (void)expert_ids; (void)weights; (void)count; (void)input;
+    (void)output;
+    g4_set_error(backend, "the VRAM expert cache is not available on Windows yet");
+    return -1;
+#else
+    uint32_t selected;
+    uint8_t launched[64];
+    double started;
+    if (count > 64) {
+        g4_set_error(backend, "too many routed experts for the staged loader");
+        return -1;
+    }
+    for (selected = 0; selected < count; ++selected)
+        if (!isfinite(weights[selected])) {
+            g4_set_error(backend, "expert weight is not finite");
+            return -1;
+        }
+    if (!backend->stage_ready || backend->stage_layer != descriptor->layer) {
+        /* run_experts without a preceding prepare_layer: stage the misses now. */
+        uint32_t missing[64], kept = 0;
+        if (g4_stage_join(backend) != 0) return -1;
+        for (selected = 0; selected < count; ++selected)
+            if (!coli_gemma4_cuda_expert_resident(backend->cuda, descriptor->layer,
+                                                  expert_ids[selected]))
+                missing[kept++] = expert_ids[selected];
+        if (g4_stage_start(backend, descriptor, missing, kept) != 0) return -1;
+    }
+    memset(launched, 0, sizeof(launched));
+    if (coli_gemma4_cuda_layer_begin(backend->cuda, input, backend->last_error,
+                                     sizeof(backend->last_error)) != 0) return -1;
+    /* Resident experts first: the GPU computes them while the reads finish. */
+    for (selected = 0; selected < count; ++selected) {
+        if (!coli_gemma4_cuda_expert_resident(backend->cuda, descriptor->layer,
+                                              expert_ids[selected])) continue;
+        if (coli_gemma4_cuda_expert_launch(
+                backend->cuda, descriptor->layer, expert_ids[selected], NULL,
+                (size_t)descriptor->component_bytes[G4_ROLE_GATE],
+                (size_t)descriptor->component_bytes[G4_ROLE_UP], 1.0F,
+                weights[selected], backend->last_error,
+                sizeof(backend->last_error)) != 0) return -1;
+        launched[selected] = 1;
+    }
+    started = g4_now_seconds();
+    if (g4_stage_join(backend) != 0) return -1;
+    backend->load_seconds += g4_now_seconds() - started;
+    for (selected = 0; selected < count; ++selected) {
+        g4_stage *stage;
+        if (launched[selected]) continue;
+        stage = g4_stage_find(backend, descriptor->layer, expert_ids[selected]);
+        if (!stage) {
+            g4_set_error(backend, "expert %u of layer %u was neither resident nor staged",
+                         expert_ids[selected], descriptor->layer);
+            return -1;
+        }
+        backend->cache_bytes_loaded += descriptor->payload_bytes;
+        ++backend->cache_misses;
+        if (coli_gemma4_cuda_expert_launch(
+                backend->cuda, descriptor->layer, expert_ids[selected], stage->buffer,
+                (size_t)descriptor->component_bytes[G4_ROLE_GATE],
+                (size_t)descriptor->component_bytes[G4_ROLE_UP], stage->scale,
+                weights[selected], backend->last_error,
+                sizeof(backend->last_error)) != 0) return -1;
+    }
+    backend->stage_ready = 0;
+    if (coli_gemma4_cuda_layer_finish(backend->cuda, output, backend->last_error,
+                                      sizeof(backend->last_error)) != 0) return -1;
+    return 0;
+#endif
+}
+
 static int g4_run_experts(void *opaque, uint32_t layer,
                           const uint32_t *expert_ids, const float *weights,
                           uint32_t count, const float *input, float *output) {
@@ -1609,6 +1989,13 @@ static int g4_run_experts(void *opaque, uint32_t layer,
     if (descriptor->payload_bytes > SIZE_MAX) {
         g4_set_error(backend, "expert payload does not fit in memory");
         return -1;
+    }
+    if (g4_vram_cache_active(backend)) {
+        double started = g4_now_seconds();
+        int status = g4_run_experts_vram(backend, descriptor, expert_ids, weights,
+                                         count, input, output);
+        backend->gpu_seconds += g4_now_seconds() - started;
+        return status;
     }
     if (!backend->cache_capacity)
         payload = (uint8_t *)malloc((size_t)descriptor->payload_bytes);
@@ -1664,6 +2051,7 @@ static int g4_prefetch_layer(void *opaque, uint32_t layer,
     const coli_gemma4_layer *descriptor = coli_gemma4_find_layer(backend, layer);
     uint32_t i, missing = 0;
     if (!backend || !backend->lookahead_enabled) return 0;
+    if (g4_vram_cache_active(backend)) return 0;
     if (g4_validate_expert_ids(backend, descriptor, layer,
                                expert_ids, count) != 0 ||
         g4_prefetch_wait(backend) != 0) return -1;
@@ -1679,7 +2067,9 @@ static int g4_prefetch_layer(void *opaque, uint32_t layer,
         backend->prefetch->capacity = count;
     }
     for (i = 0; i < count; ++i)
-        if (!g4_cache_find(backend, layer, expert_ids[i], NULL))
+        if (!g4_cache_find(backend, layer, expert_ids[i], NULL) &&
+            !(g4_vram_cache_active(backend) &&
+              coli_gemma4_cuda_expert_resident(backend->cuda, layer, expert_ids[i])))
             backend->prefetch->expert_ids[missing++] = expert_ids[i];
     return g4_prefetch_start(backend, descriptor, missing, 1);
 }

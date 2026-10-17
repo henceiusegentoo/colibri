@@ -1439,6 +1439,53 @@ FAMILIES = (
         # coli chat, coli serve and coli web already use.
         has_cli_adapter=False,
     ),
+    FamilyDescriptor(
+        id="gemma4",
+        model_types=("gemma4", "gemma4_text"),
+        display_name="Gemma 4 26B-A4B",
+        display_scale="26B",
+        # google/gemma-4-26B-A4B: 30 layers (25 sliding-window + 5 global), 128
+        # routed experts with top-8 plus a dense MLP in every layer. Only the
+        # 26B-A4B geometry is registered; any other gemma4 config names itself.
+        display_variants=(
+            DisplayVariant((("num_hidden_layers", 30), ("num_experts", 128),
+                            ("hidden_size", 2816)),
+                           "Gemma 4 26B-A4B", "26B"),
+        ),
+        engine_artifact="gemma4",
+        engine_aliases=(),
+        engine_group="gemma4",
+        internal_arch="gemma4",
+        build_target="gemma4",
+        process_names=("gemma4",),
+        default_model_id="gemma-4-26b-a4b-colibri",
+        cli_adapter="gemma4",
+        gateway_adapter="gemma4",
+        planner_id="gemma4",
+        # The planner sizes caches from safetensors tensor inventories. Gemma's
+        # engine reads a GGUF and an expert manifest instead, so there is nothing
+        # for the planner to inventory; the engine sizes its own caches (the cap
+        # argument = expert records held in RAM, GEMMA4_CUDA_* = VRAM budget).
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "the Gemma 4 engine reads a GGUF checkpoint and sizes its own expert "
+            "caches; use --cap (RAM expert records) and --vram instead"),
+        expert_inventory=lambda name, size, _config, _dtype=None: (),
+        config_section="text_config",
+        # 4096 default context keeps the 5 global-attention layers' KV small
+        # (about 40 KiB per token). implicit_cap is expert RECORDS in host RAM
+        # (3.2 MiB each at Q4_0), not slots per layer: 1024 is about 3.3 GiB.
+        limits=FamilyLimits(4096, 262144, 1024, 8192, 1, 1024, "CTX"),
+        # Tool calls and grammars exist in the engine, but the gateway side is not
+        # wired yet; capabilities say so and render_chat_gemma4 refuses tools.
+        capabilities=FamilyCapabilities(False, False, False, True),
+        has_gateway_adapter=True,
+        # coli run needs a per-arch one-shot branch that does not exist for Gemma;
+        # chat, serve and web all work through the gateway.
+        has_cli_adapter=False,
+        tune_prompt_template=(
+            "<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+    ),
 )
 
 

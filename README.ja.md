@@ -17,9 +17,9 @@
 （AI メモリのマルチティア化）ことで、**744B から 2.8T パラメータのフロンティア MoE モデル**を、
 コンシューマー向けや異種混在のハードウェア上で、エンジン依存ゼロの純粋な C で実行します。
 
-現在動作するのは 9 つのファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
+現在動作するのは 10 個のファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
 ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B、ビジョン対応）、
-**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、そして
+**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、**Gemma 4 26B-A4B**（26B、GGUF）、そして
 **OLMoE**（7B）——
 それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有します。
 [全モデル一覧 ↓](#other-supported-models)

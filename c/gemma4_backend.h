@@ -46,6 +46,8 @@ typedef struct {
     uint64_t evictions;
     uint64_t promotions;
     uint64_t bytes_loaded;
+    double load_seconds;
+    double gpu_seconds;
 } coli_gemma4_cache_stats;
 
 typedef struct {
@@ -77,6 +79,12 @@ typedef struct {
     coli_gemma4_prefetch_state *prefetch;
     int lookahead_enabled;
     void *cuda;
+    int direct_fd1, plain_fd1; /* source GGUF descriptors, stored as fd + 1 (0 = closed) */
+    void *stage;               /* parallel miss loader: array of staged expert records */
+    uint32_t stage_capacity, stage_count, stage_layer;
+    int stage_ready;
+    double load_seconds;      /* wall time the model thread waited for expert reads */
+    double gpu_seconds;       /* wall time in the batched GPU expert path */
     char source[COLI_GEMMA4_PATH_MAX];
     char packed_dir[COLI_GEMMA4_PATH_MAX];
     char last_error[COLI_GEMMA4_ERROR_MAX];

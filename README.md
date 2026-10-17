@@ -18,10 +18,10 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Nine families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
+Ten families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
 vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, with vision),
-**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
-**OLMoE** (7B) —
+**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B),
+**Gemma 4 26B-A4B** (26B, GGUF) and **OLMoE** (7B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 [Full roster ↓](#other-supported-models)
 
@@ -460,6 +460,7 @@ the model's `config.json`):
 | **DeepSeek V4.1 Flash** | 552B / 16B | official checkpoint, **no conversion**: experts are already fp4, dense is fp8-e4m3. 203 GB of it is an n-gram memory read from disk a few hundred bytes at a time, and the routed experts cost **4.5 GB per token** against GLM-5.2's 12.7. Vision, tool calling and the DSpark draft head are all on | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
 | **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (CPU only) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
+| **Gemma 4 26B-A4B** (Google) | 26B / 4B | [`google/gemma-4-26B-A4B-it-qat-q4_0-gguf`](https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf) (14.4 GB, Google's quantization-aware Q4_0) — the **GGUF is read in place**: dense weights stay resident, routed experts stream from the file; with `CUDA=1` the dense matrices live in VRAM and spare VRAM becomes an expert cache | `make -C c gemma4` (`CUDA=1` for the GPU tier) | [gemma4.md](docs/gemma4.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
 
 Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
@@ -682,6 +683,7 @@ c/
 ├── deepseek_v4.c         DeepSeek V4 Flash engine  (make deepseek-v4)
 ├── qwen38.c              Qwen3.8-Flash-Next text engine  (make qwen38)
 ├── qwen36.c              Qwen3.6 engine  (make qwen36)
+├── gemma4.c              Gemma 4 26B-A4B engine, GGUF in place  (make gemma4)
 ├── olmoe.c               OLMoE engine  (make olmoe)
 │
 ├── st.h                  safetensors index and range reads

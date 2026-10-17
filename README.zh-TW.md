@@ -10,9 +10,9 @@
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行九個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
+目前可執行十個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
 **Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、
-**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
+**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、**Gemma 4 26B-A4B**（26B，GGUF）與 **OLMoE**（7B）
 ——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
 
 > **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在

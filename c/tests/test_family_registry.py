@@ -1028,6 +1028,10 @@ class FamilyRegistryTest(unittest.TestCase):
                       "and prioritize correctness, consistency, and clarity in the final answer."
                       "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
+            # Gemma 4's canonical template, thinking off: <bos>, one user turn, and the
+            # generation prompt with the empty thought channel pre-closed.
+            "gemma4": "<bos><|turn>user\nhello {world}<turn|>\n<|turn>model\n"
+                      "<|channel>thought\n<channel|>",
             "deepseek_v4": "hello {world}",
             # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
             # not a jinja template, so the replay prompt stays the bare text like V4.

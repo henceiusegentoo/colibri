@@ -639,11 +639,25 @@ refuses tool declarations unless `COLI_TOOL_FALLBACK=1` is set.
 MLP) and the Q6_K token embedding / LM head are uploaded once and stay in VRAM;
 a matvec ships only the activation vector. Routed experts live in a VRAM slab
 managed as an LRU of fixed-size record slots, sized from whatever VRAM the dense
-matrices left (minus `GEMMA4_CUDA_RESERVE_MB`, default 256). A layer is one input
-upload, up to top-8 expert launches that accumulate on the device, and one output
-download. Attention math, norms and the router still run on the CPU. If a matrix
-does not fit it simply stays on the CPU, so a small card degrades instead of
-failing.
+matrices and the device KV caches left (minus `GEMMA4_CUDA_RESERVE_MB`, default
+256). If a matrix does not fit it simply stays on the CPU, so a small card degrades
+instead of failing.
+
+**Whole-layer decode on the device.** For every layer whose matrices are resident,
+one token's layer runs on the GPU: input norm, Q/K/V, per-head QK norm and the
+unweighted V norm, NEOX RoPE (with the global layers' frequency factors),
+sliding-window / global attention over a device KV cache, output projection,
+post-attention norm and residual, FFN norm, router (softmax, top-k, renormalise),
+the dense MLP, the post-norms, combine and layer scale. Per layer the host sees one
+residual upload, the selected expert ids and weights plus the new K/V row coming
+back (so the host KV cache stays an exact mirror), and one output download. The
+kernels are adapted from existing ones rather than written from scratch: RMSNorm,
+NEOX RoPE and the softmax/top-k router follow llama.cpp's ggml-cuda `norm.cu`,
+`rope.cu` and `topk-moe.cu`; the attention and ring-slot indexing follow this
+repository's own `backend_cuda*.cu` kernels. `GEMMA4_CUDA_ATTN=0` turns the device
+layer off (CPU attention with GPU matvecs); a layer that cannot be built, or any
+step the device path declines, runs the CPU path unchanged. The vision path and
+batched prefill keep using the CPU attention and write the same KV mirror.
 
 **Expert misses** are read straight from the GGUF with `pread`, one thread per
 missed expert, into page-locked staging buffers that the GPU copies from. The reads
@@ -657,11 +671,12 @@ buffered, because the OS cache otherwise holds most of the 14.4 GB file.
 |---|---|
 | `GEMMA4_CUDA_DEVICE` | CUDA device index (overrides `coli --gpu`) |
 | `GEMMA4_CUDA_DENSE=0` | keep dense matrices on the CPU |
+| `GEMMA4_CUDA_ATTN=0` | keep attention, router and norms on the CPU (dense matvecs stay on the GPU) |
 | `GEMMA4_CUDA_EXPERT_MB` | cap the VRAM expert slab; `0` disables it |
 | `GEMMA4_CUDA_RESERVE_MB` | VRAM left free for the runtime (default 256) |
 | `GEMMA4_IO=direct` | bypass the page cache for expert reads |
 
-`gemma4` reports the VRAM hit rate, disk wait and per-phase time on exit.
+`gemma4` reports the VRAM hit rate, disk wait, per-stage times and how many layer steps ran on the GPU on exit.
 
 **Validation.** `tests/test_gemma4_cuda.c` compares the Q4_0 and Q6_K kernels and a
 randomised LRU expert-cache schedule (1,200 launches over 20 slots, constant
@@ -678,13 +693,30 @@ single runs, greedy decoding, so treat the numbers as indicative):
 | Setup | Throughput |
 |---|---|
 | CPU only, `--expert-cache 512` | about 1 token/s (76 evaluations in 73 s) |
-| CUDA, resident dense + VRAM expert cache (1,167 slots, 1.46 GB dense) | about 7 tokens/s |
+| CUDA, resident dense + VRAM expert cache, attention/router/norms still on the CPU | about 7 tokens/s |
+| CUDA, whole layer on the device (`GEMMA4_CUDA_ATTN=1`, default) | about 9.3 tokens/s (233 tokens in 25 s) |
 
-The VRAM expert cache hit 78-79% on 48- and 200-token generations; the first request
-after start-up is slower (4.8 tokens/s) while the OS cache fills. Of a 200-token
-run (33 s), attention took 8.6 s, the rest of the layer 20.7 s, of which the
-expert path was 15.4 s and 9.6 s of that was waiting for disk reads. Disk and CPU
-attention are the remaining limits, not the GPU kernels.
+Prefill of a 1,311-token prompt took 67 s with device attention against 254 s with CPU
+attention (same GPU matvecs).
+
+Where the 200-token run goes now (25 s, 6,990 layer steps, VRAM expert hit rate 78%):
+`attend` 3.7 s, `prepare_layer` 0.5 s, dense MLP launch 0.1 s, experts 10.6 s
+(10.2 s of it waiting for expert reads from the OS page cache / NVMe), `complete`
+5.9 s (the wait for the layer's queued GPU work, including the host-to-device copies
+of missed experts). The device kernels are latency-bound rather than bandwidth-bound:
+a layer is about 40 small serial launches, each with a sync at the attend and
+complete boundaries, while the bytes read per layer would take well under 0.2 ms.
+Expert reads are the largest single cost; hiding them needs speculative prefetch,
+and the launch overhead would shrink with CUDA graphs or concurrent expert streams.
+None of that is done.
+
+**Device-layer validation.** The tiny-fixture oracle is token-exact with the device
+layer active at cache sizes 1, 2 and 8 (the test prints `layer steps gpu=2 cpu=0`
+for the fixture; before the fixture could use a 2-slot VRAM cache it only exercised
+the CPU path). On the real model, final logits with the device layer against CPU
+attention (both with GPU matvecs): 10-token prompt cosine 0.9999998, max |diff|
+2.7e-4, KL 5e-10; 1,011 and 1,311-token prompts (the latter wraps the 1,024-token
+sliding window) KL 1.5e-10 and 8.9e-11, max |diff| 1e-4 and 2e-4, same top-10 order.
 
 ## Real-model validation
 

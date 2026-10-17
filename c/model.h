@@ -30,6 +30,12 @@ typedef struct {
     void (*release_layer)(void *ctx, uint32_t layer);
     int (*prefetch_layer)(void *ctx, uint32_t layer,
                           const uint32_t *expert_ids, uint32_t count);
+    /* Optional. Same as run_experts for a layer whose input already sits on the device
+     * and whose output stays there (the GPU decode path). Returns 0, -2 when this
+     * backend cannot do that right now (the caller uses run_experts), or -1 on error. */
+    int (*run_experts_device)(void *ctx, uint32_t layer,
+                              const uint32_t *expert_ids, const float *weights,
+                              uint32_t count);
 } coli_expert_backend;
 
 typedef struct {

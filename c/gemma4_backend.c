@@ -1405,7 +1405,7 @@ static int g4_stage_start(coli_gemma4_backend *backend,
         backend->stage_ready = 1;
         return 0;
     }
-    if (g4_io_open(backend) != 0) return -1;
+    if (!coli_gemma4_has_packed_layer(backend, layer) && g4_io_open(backend) != 0) return -1;
     if (count > backend->stage_capacity) {
         size_t scratch_bytes = (size_t)(layer->component_bytes[G4_ROLE_GATE] +
                                         layer->component_bytes[G4_ROLE_UP]);
@@ -1445,6 +1445,14 @@ static int g4_stage_start(coli_gemma4_backend *backend,
         stages[i].layer = layer;
         stages[i].expert = expert_ids[i];
         stages[i].status = 0;
+        stages[i].started = 0;
+        if (coli_gemma4_has_packed_layer(backend, layer)) {
+            /* Packed layer files (not the in-place GGUF layout) go through the
+             * original loader on this thread. */
+            stages[i].status = g4_load_record(backend, layer, expert_ids[i],
+                                              stages[i].buffer, &stages[i].scale) == 0 ? 0 : -1;
+            continue;
+        }
         stages[i].started = pthread_create(&stages[i].thread, NULL,
                                            g4_stage_thread, &stages[i]) == 0;
         if (!stages[i].started) stages[i].status = g4_stage_read(&stages[i]);
@@ -1895,6 +1903,8 @@ static int g4_prepare_layer(void *opaque, uint32_t layer,
  * accumulate weight * expert_output on the device, one output download. VRAM-resident
  * experts are launched without touching host memory; the rest come from the host
  * cache (or disk) and are copied into the LRU slot on the way. */
+/* input == NULL: the layer input is already on the device (written by the device
+ * attention stage); output == NULL: leave the accumulated result on the device. */
 static int g4_run_experts_vram(coli_gemma4_backend *backend,
                                const coli_gemma4_layer *descriptor,
                                const uint32_t *expert_ids, const float *weights,
@@ -1928,8 +1938,11 @@ static int g4_run_experts_vram(coli_gemma4_backend *backend,
         if (g4_stage_start(backend, descriptor, missing, kept) != 0) return -1;
     }
     memset(launched, 0, sizeof(launched));
-    if (coli_gemma4_cuda_layer_begin(backend->cuda, input, backend->last_error,
-                                     sizeof(backend->last_error)) != 0) return -1;
+    if ((input ? coli_gemma4_cuda_layer_begin(backend->cuda, input, backend->last_error,
+                                              sizeof(backend->last_error))
+               : coli_gemma4_cuda_layer_begin_resident(backend->cuda, backend->last_error,
+                                                       sizeof(backend->last_error))) != 0)
+        return -1;
     /* Resident experts first: the GPU computes them while the reads finish. */
     for (selected = 0; selected < count; ++selected) {
         if (!coli_gemma4_cuda_expert_resident(backend->cuda, descriptor->layer,
@@ -1964,10 +1977,32 @@ static int g4_run_experts_vram(coli_gemma4_backend *backend,
                 sizeof(backend->last_error)) != 0) return -1;
     }
     backend->stage_ready = 0;
-    if (coli_gemma4_cuda_layer_finish(backend->cuda, output, backend->last_error,
+    if (output &&
+        coli_gemma4_cuda_layer_finish(backend->cuda, output, backend->last_error,
                                       sizeof(backend->last_error)) != 0) return -1;
     return 0;
 #endif
+}
+
+/* Device-resident variant used by the GPU decode path. */
+static int g4_run_experts_device(void *opaque, uint32_t layer,
+                                 const uint32_t *expert_ids, const float *weights,
+                                 uint32_t count) {
+    coli_gemma4_backend *backend = (coli_gemma4_backend *)opaque;
+    const coli_gemma4_layer *descriptor = coli_gemma4_find_layer(backend, layer);
+    double started;
+    int status;
+    if (!backend || !descriptor || !count || !expert_ids || !weights) {
+        if (backend) g4_set_error(backend, "invalid Gemma run_experts_device request");
+        return -1;
+    }
+    if (!g4_vram_cache_active(backend)) return -2;
+    if (g4_validate_expert_ids(backend, descriptor, layer, expert_ids, count) != 0) return -1;
+    if (g4_prefetch_wait(backend) != 0) return -1;
+    started = g4_now_seconds();
+    status = g4_run_experts_vram(backend, descriptor, expert_ids, weights, count, NULL, NULL);
+    backend->gpu_seconds += g4_now_seconds() - started;
+    return status;
 }
 
 static int g4_run_experts(void *opaque, uint32_t layer,
@@ -2082,6 +2117,7 @@ coli_expert_backend coli_gemma4_expert_backend(coli_gemma4_backend *backend) {
     result.release_layer = g4_release_layer;
     result.prefetch_layer = backend && backend->lookahead_enabled ?
                             g4_prefetch_layer : NULL;
+    result.run_experts_device = g4_run_experts_device;
     return result;
 }
 

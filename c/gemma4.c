@@ -785,7 +785,15 @@ static void report_expert_cache(const coli_gemma4_backend *backend) {
     {
         double attention = 0.0, complete = 0.0;
         coli_gemma4_model_profile(&attention, &complete);
-        fprintf(stderr, "phase time: attention=%.2fs layer-rest=%.2fs\n", attention, complete);
+        unsigned long long gpu_steps = 0, cpu_steps = 0;
+        coli_gemma4_model_layer_counts(&gpu_steps, &cpu_steps);
+        double stage[5];
+        coli_gemma4_model_stage_times(stage);
+        fprintf(stderr, "phase time: attention=%.2fs layer-rest=%.2fs; layer steps gpu=%llu cpu=%llu\n",
+                attention, complete, gpu_steps, cpu_steps);
+        if (gpu_steps)
+            fprintf(stderr, "gpu stages: attend=%.2fs prepare=%.2fs dense=%.2fs experts=%.2fs complete=%.2fs\n",
+                    stage[0], stage[1], stage[2], stage[3], stage[4]);
     }
     coli_gemma4_cache_get_stats(backend, &stats);
     if (!stats.capacity) return;

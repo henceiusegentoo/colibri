@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -522,14 +524,18 @@ static void ensure_slab(gemma4_cuda_context *context) {
     size_t slots = usable / context->stride;
     if (slots > static_cast<size_t>(context->layers) * context->experts)
         slots = static_cast<size_t>(context->layers) * context->experts;
-    if (slots < 16) return;
-    while (slots >= 16) {
+    const size_t total_experts = static_cast<size_t>(context->layers) * context->experts;
+    const size_t minimum_slots = total_experts < 16 ? total_experts : 16;
+    if (slots < minimum_slots) return;
+    while (slots >= minimum_slots) {
         if (cudaMalloc(&context->slab, slots * context->stride) == cudaSuccess) break;
         cudaGetLastError();
         context->slab = nullptr;
+        if (slots <= minimum_slots) break;
         slots -= slots / 16 + 1;
+        if (slots < minimum_slots) slots = minimum_slots;
     }
-    if (!context->slab || slots < 16) return;
+    if (!context->slab || slots < minimum_slots) return;
     context->slot_key = static_cast<int64_t *>(std::malloc(sizeof(int64_t) * slots));
     context->slot_stamp = static_cast<uint64_t *>(std::calloc(slots, sizeof(uint64_t)));
     context->slot_scale = static_cast<float *>(std::calloc(slots, sizeof(float)));
@@ -663,4 +669,623 @@ extern "C" void coli_gemma4_cuda_expert_cache_stats(
     if (hits) *hits = context ? context->hits : 0;
     if (misses) *misses = context ? context->misses : 0;
     if (evictions) *evictions = context ? context->evictions : 0;
+}
+
+/* ======================================================================================
+ * Whole-layer decode on the device (one token).
+ *
+ * Almost everything below is adapted from kernels that already exist:
+ *   k_rms_norm        <- llama.cpp ggml-cuda/norm.cu  rms_norm_f32 (non-vector path, with the
+ *                        fused multiply / add / scale variants); the per-head QK norm is the same
+ *                        kernel with one block per head and a broadcast weight
+ *   k_rope_neox       <- llama.cpp ggml-cuda/rope.cu  rope_neox (freq_factors path; the YaRN terms
+ *                        are dropped because this model uses plain RoPE)
+ *   k_topk_softmax    <- llama.cpp ggml-cuda/topk-moe.cu  topk_moe_cuda (softmax, iterative
+ *                        warp argmax, renormalise); bias / sigmoid / group-mask paths removed
+ *   k_attention       <- the score / max / sum / value passes of colibri's
+ *                        attention_absorb_batch_kernel, with colibri's ring-slot indexing from
+ *                        attention_window_kernel; grouped-query head mapping, no 1/sqrt(d) scale
+ *                        (Gemma 4 normalises Q and K instead), matching the CPU reference
+ *   k_kv_store        <- colibri cache_store
+ *   k_router_logits   <- colibri pipe_router_logits (softmax variant)
+ * The quantised matvecs are the kernels above in this file.
+ * ====================================================================================== */
+
+#define G4_WARP 32
+
+__device__ __forceinline__ float g4_warp_max(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xFFFFFFFFU, value, offset));
+    return value;
+}
+
+/* ggml-cuda block_reduce<SUM / MAX>: every thread receives the block result. */
+__device__ __forceinline__ float g4_block_sum(float value, float *shared) {
+    value = warp_sum(value);
+    if (blockDim.x > G4_WARP) {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        __syncthreads();
+        if (lane == 0) shared[warp] = value;
+        __syncthreads();
+        value = lane < (int)(blockDim.x >> 5) ? shared[lane] : 0.0F;
+        value = warp_sum(value);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float g4_block_max(float value, float *shared) {
+    value = g4_warp_max(value);
+    if (blockDim.x > G4_WARP) {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        __syncthreads();
+        if (lane == 0) shared[warp] = value;
+        __syncthreads();
+        value = lane < (int)(blockDim.x >> 5) ? shared[lane] : -FLT_MAX;
+        value = g4_warp_max(value);
+    }
+    return value;
+}
+
+/* out[row] = (norm(x[row]) * w + add[row]) * scale_out. w is shared by every row
+ * (null = unweighted), add is per row (null = none). x == out is allowed. */
+__global__ static void k_rms_norm(const float *x, const float *w, const float *add,
+                                  float *out, int n, float eps, float scale_out) {
+    __shared__ float shared[32];
+    const size_t base = (size_t)blockIdx.x * n;
+    const float *xc = x + base;
+    float partial = 0.0F;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) partial += xc[i] * xc[i];
+    const float total = g4_block_sum(partial, shared);
+    const float scale = 1.0F / sqrtf(total / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = scale * xc[i];
+        if (w) v *= w[i];
+        if (add) v += add[base + i];
+        out[base + i] = v * scale_out;
+    }
+}
+
+/* NEOX rotation of pairs (k, k + half) with per-pair frequency factors. */
+__global__ static void k_rope_neox(float *x, int heads, int head_dim, int position,
+                                   float base, const float *factors) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x, half = head_dim / 2;
+    if (index >= heads * half) return;
+    const int head = index / half, k = index % half;
+    const float factor = factors ? factors[k] : 1.0F;
+    const float frequency = powf(base, -2.0F * (float)k / (float)head_dim) / factor;
+    const float angle = (float)position * frequency;
+    const float c = cosf(angle), s = sinf(angle);
+    float *row = x + (size_t)head * head_dim;
+    const float first = row[k], second = row[k + half];
+    row[k] = first * c - second * s;
+    row[k + half] = second * c + first * s;
+}
+
+__global__ static void k_kv_store(float *key_cache, float *value_cache, int slot,
+                                  const float *key, const float *value, int kv_width,
+                                  float *exported) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_width) return;
+    key_cache[(size_t)slot * kv_width + i] = key[i];
+    value_cache[(size_t)slot * kv_width + i] = value[i];
+    exported[i] = key[i];
+    exported[kv_width + i] = value[i];
+}
+
+/* One block per query head: scores (a warp per cached position), softmax with the
+ * block max/sum reductions, then the probability-weighted sum of V. */
+__global__ static void k_attention(const float *q, const float *key_cache,
+                                   const float *value_cache, float *context,
+                                   float *scores_all, int head_dim, int queries_per_kv,
+                                   int kv_width, int capacity, int sliding,
+                                   unsigned long long first_position, int history,
+                                   int score_stride) {
+    __shared__ float shared[32];
+    const int head = blockIdx.x, kv_head = head / queries_per_kv;
+    const int tid = threadIdx.x, warps = blockDim.x >> 5, warp = tid >> 5, lane = tid & 31;
+    const float *query_head = q + (size_t)head * head_dim;
+    float *scores = scores_all + (size_t)head * score_stride;
+    const int first_slot = sliding ? (int)(first_position % (unsigned long long)capacity)
+                                   : (int)first_position;
+    for (int t = warp; t < history; t += warps) {
+        int slot = first_slot + t;
+        if (sliding && slot >= capacity) slot -= capacity;
+        const float *key_head = key_cache + (size_t)slot * kv_width + (size_t)kv_head * head_dim;
+        float score = 0.0F;
+        for (int d = lane; d < head_dim; d += 32) score += query_head[d] * key_head[d];
+        score = warp_sum(score);
+        if (lane == 0) scores[t] = score;
+    }
+    __syncthreads();
+    float local = -FLT_MAX;
+    for (int t = tid; t < history; t += blockDim.x) local = fmaxf(local, scores[t]);
+    const float maximum = g4_block_max(local, shared);
+    local = 0.0F;
+    for (int t = tid; t < history; t += blockDim.x) {
+        const float e = expf(scores[t] - maximum);
+        scores[t] = e;
+        local += e;
+    }
+    const float denominator = g4_block_sum(local, shared);
+    __syncthreads();
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float accumulator = 0.0F;
+        for (int t = 0; t < history; ++t) {
+            int slot = first_slot + t;
+            if (sliding && slot >= capacity) slot -= capacity;
+            accumulator += (scores[t] / denominator) *
+                value_cache[(size_t)slot * kv_width + (size_t)kv_head * head_dim + d];
+        }
+        context[(size_t)head * head_dim + d] = accumulator;
+    }
+}
+
+__global__ static void k_router_logits(const float *projection, const float *input,
+                                       int width, float *logits) {
+    __shared__ float shared[32];
+    const float *row = projection + (size_t)blockIdx.x * width;
+    float partial = 0.0F;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) partial += row[i] * input[i];
+    const float total = g4_block_sum(partial, shared);
+    if (threadIdx.x == 0) logits[blockIdx.x] = total;
+}
+
+__global__ static void k_gelu_mul(const float *gate, const float *up, int count,
+                                  float *hidden) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = gate[i];
+    hidden[i] = 0.5F * v * (1.0F + tanhf(0.7978845608028654F *
+                                          (v + 0.044715F * v * v * v))) * up[i];
+}
+
+/* Softmax -> top-k -> renormalise, one warp. Lifted from topk_moe_cuda (softmax,
+ * with_norm path); NaN logits are sanitised exactly as there so the iterative argmax
+ * always yields distinct experts. Ties go to the lower expert index. */
+template <int n_experts>
+__global__ static void k_topk_softmax(const float *logits, float *weights, int32_t *ids,
+                                      int n_expert_used, float clamp_val) {
+    constexpr int experts_per_thread = (n_experts > G4_WARP) ? n_experts / G4_WARP : 1;
+    const int lane = threadIdx.x;
+    float wt[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) wt[i] = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < n_experts; i += G4_WARP) {
+        const int expert = i + lane;
+        wt[i / G4_WARP] = (n_experts % G4_WARP == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+    }
+    float max_val = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) max_val = fmaxf(max_val, wt[i]);
+    max_val = g4_warp_max(max_val);
+    float sum = 0.0F;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const float v = expf(wt[i] - max_val);
+        wt[i] = v;
+        sum += v;
+    }
+    sum = warp_sum(sum);
+    const float inv_sum = 1.0F / sum;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) wt[i] *= inv_sum;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++)
+        if (isnan(wt[i])) wt[i] = -FLT_MAX;
+
+    float wt_sum = 0.0F;
+    float output_weights[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) output_weights[i] = 0.0F;
+    for (int k = 0; k < n_expert_used; k++) {
+        float best = wt[0];
+        int best_expert = lane;
+#pragma unroll
+        for (int i = 1; i < experts_per_thread; i++) {
+            const int expert = lane + i * G4_WARP;
+            if ((n_experts % G4_WARP == 0 || expert < n_experts) && wt[i] > best) {
+                best = wt[i];
+                best_expert = expert;
+            }
+        }
+#pragma unroll
+        for (int mask = G4_WARP / 2; mask > 0; mask /= 2) {
+            const float other = __shfl_xor_sync(0xFFFFFFFFU, best, mask, G4_WARP);
+            const int other_expert = __shfl_xor_sync(0xFFFFFFFFU, best_expert, mask, G4_WARP);
+            if (other > best || (other == best && other_expert < best_expert)) {
+                best = other;
+                best_expert = other_expert;
+            }
+        }
+        if ((best_expert & (G4_WARP - 1)) == lane) wt[best_expert / G4_WARP] = -INFINITY;
+        if ((k & (G4_WARP - 1)) == lane) output_weights[k / G4_WARP] = best;
+        if ((best_expert & (G4_WARP - 1)) == lane) {
+            ids[k] = best_expert;
+            wt_sum += best;
+        }
+    }
+    wt_sum = warp_sum(wt_sum);
+    wt_sum = fmaxf(wt_sum, clamp_val);
+    const float inv_selected = 1.0F / wt_sum;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int idx = i * G4_WARP + lane;
+        if (idx < n_expert_used) weights[idx] = output_weights[i] * inv_selected;
+    }
+}
+
+/* ---- host side ------------------------------------------------------------------- */
+
+#define G4_MAX_SELECTED 32
+
+struct gemma4_gpu_scratch {
+    size_t model_width, query_width, kv_width, intermediate, experts, score_floats;
+    float *res, *norm, *q, *k, *v, *kv_export, *context, *attn, *after, *dense_in,
+          *router_norm, *router_logits, *router_weights, *hidden_gate, *hidden_up, *hidden,
+          *dense_out, *dense_norm, *combined, *out, *scores;
+    int32_t *router_ids;
+    float *host_kv, *host_weights;
+    int32_t *host_ids;
+};
+static gemma4_gpu_scratch g_scratch;
+
+static void scratch_free(void) {
+    float **device[] = {&g_scratch.res, &g_scratch.norm, &g_scratch.q, &g_scratch.k,
+        &g_scratch.v, &g_scratch.kv_export, &g_scratch.context, &g_scratch.attn,
+        &g_scratch.after, &g_scratch.dense_in, &g_scratch.router_norm,
+        &g_scratch.router_logits, &g_scratch.router_weights, &g_scratch.hidden_gate,
+        &g_scratch.hidden_up, &g_scratch.hidden, &g_scratch.dense_out, &g_scratch.dense_norm,
+        &g_scratch.combined, &g_scratch.out, &g_scratch.scores};
+    for (size_t i = 0; i < sizeof(device) / sizeof(device[0]); ++i) {
+        cudaFree(*device[i]);
+        *device[i] = nullptr;
+    }
+    cudaFree(g_scratch.router_ids);
+    g_scratch.router_ids = nullptr;
+    cudaFreeHost(g_scratch.host_kv); cudaFreeHost(g_scratch.host_weights);
+    cudaFreeHost(g_scratch.host_ids);
+    g_scratch.host_kv = g_scratch.host_weights = nullptr;
+    g_scratch.host_ids = nullptr;
+}
+
+static bool scratch_reserve(size_t model_width, size_t query_width, size_t kv_width,
+                            size_t intermediate, size_t experts, size_t score_floats) {
+    gemma4_gpu_scratch &s = g_scratch;
+    if (s.res && s.model_width >= model_width && s.query_width >= query_width &&
+        s.kv_width >= kv_width && s.intermediate >= intermediate &&
+        s.experts >= experts && s.score_floats >= score_floats) return true;
+    if (model_width < s.model_width) model_width = s.model_width;
+    if (query_width < s.query_width) query_width = s.query_width;
+    if (kv_width < s.kv_width) kv_width = s.kv_width;
+    if (intermediate < s.intermediate) intermediate = s.intermediate;
+    if (experts < s.experts) experts = s.experts;
+    if (score_floats < s.score_floats) score_floats = s.score_floats;
+    scratch_free();
+    struct Item { float **pointer; size_t floats; };
+    Item items[] = {{&s.res, model_width}, {&s.norm, model_width}, {&s.q, query_width},
+        {&s.k, kv_width}, {&s.v, kv_width}, {&s.kv_export, 2 * kv_width},
+        {&s.context, query_width}, {&s.attn, model_width}, {&s.after, model_width},
+        {&s.dense_in, model_width}, {&s.router_norm, model_width},
+        {&s.router_logits, experts}, {&s.router_weights, G4_MAX_SELECTED},
+        {&s.hidden_gate, intermediate}, {&s.hidden_up, intermediate},
+        {&s.hidden, intermediate}, {&s.dense_out, model_width},
+        {&s.dense_norm, model_width}, {&s.combined, model_width}, {&s.out, model_width},
+        {&s.scores, score_floats}};
+    bool ok = true;
+    for (size_t i = 0; ok && i < sizeof(items) / sizeof(items[0]); ++i)
+        ok = cudaMalloc(items[i].pointer, items[i].floats * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&s.router_ids, experts * sizeof(int32_t)) == cudaSuccess;
+    ok = ok && cudaMallocHost(&s.host_kv, 2 * kv_width * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMallocHost(&s.host_weights, G4_MAX_SELECTED * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMallocHost(&s.host_ids, G4_MAX_SELECTED * sizeof(int32_t)) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        scratch_free();
+        s.model_width = s.query_width = s.kv_width = s.intermediate = s.experts = 0;
+        s.score_floats = 0;
+        return false;
+    }
+    s.model_width = model_width; s.query_width = query_width; s.kv_width = kv_width;
+    s.intermediate = intermediate; s.experts = experts; s.score_floats = score_floats;
+    return true;
+}
+
+struct gemma4_gpu_layer {
+    uint32_t model_width, query_heads, kv_heads, head_dim, query_width, kv_width, capacity;
+    uint32_t intermediate, experts, selected;
+    int sliding, key_equals_value;
+    float epsilon, rope_base, output_scale;
+    gemma4_cuda_matrix *query, *key, *value, *output, *gate, *up, *down;
+    float *input_norm, *query_norm, *key_norm, *rope_factors;
+    float *post_attention_norm, *ffn_norm, *post_ffw_norm_1, *pre_ffw_norm_2,
+          *post_ffw_norm_2, *post_ffw_norm, *router_scale, *router_projection;
+    float *key_cache, *value_cache;
+};
+
+static float *upload_floats(const float *host, size_t count, float scale = 1.0F) {
+    float *device = nullptr;
+    if (!host || !count || cudaMalloc(&device, count * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    bool ok;
+    if (scale == 1.0F) {
+        ok = cudaMemcpy(device, host, count * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+    } else {
+        float *scaled = static_cast<float *>(std::malloc(count * sizeof(float)));
+        ok = scaled != nullptr;
+        if (ok) {
+            for (size_t i = 0; i < count; ++i) scaled[i] = host[i] * scale;
+            ok = cudaMemcpy(device, scaled, count * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        std::free(scaled);
+    }
+    if (!ok) {
+        cudaGetLastError();
+        cudaFree(device);
+        return nullptr;
+    }
+    return device;
+}
+
+static void layer_free(gemma4_gpu_layer *layer) {
+    if (!layer) return;
+    float *buffers[] = {layer->input_norm, layer->query_norm, layer->key_norm,
+        layer->rope_factors, layer->post_attention_norm, layer->ffn_norm,
+        layer->post_ffw_norm_1, layer->pre_ffw_norm_2, layer->post_ffw_norm_2,
+        layer->post_ffw_norm, layer->router_scale, layer->router_projection,
+        layer->key_cache, layer->value_cache};
+    for (size_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); ++i) cudaFree(buffers[i]);
+    std::free(layer);
+}
+
+static bool q4_matrix_ok(const void *opaque, uint32_t rows, uint32_t columns) {
+    const gemma4_cuda_matrix *m = static_cast<const gemma4_cuda_matrix *>(opaque);
+    return m && m->type == COLI_GEMMA4_CUDA_Q4_0 && m->rows == rows && m->columns == columns;
+}
+
+extern "C" void *coli_gemma4_cuda_layer_create(const coli_gemma4_cuda_layer_desc *d,
+                                                char *error, size_t error_capacity) {
+    auto fail = [&](const char *message) -> void * {
+        std::snprintf(g_error, sizeof(g_error), "%s", message);
+        if (error && error_capacity) std::snprintf(error, error_capacity, "%s", message);
+        return nullptr;
+    };
+    if (!d || !g_ctx) return fail("no CUDA context");
+    const uint32_t query_width = d->query_heads * d->head_dim, kv_width = d->kv_heads * d->head_dim;
+    if (!d->model_width || !d->query_heads || !d->kv_heads || !d->head_dim ||
+        d->head_dim % 2 || d->query_heads % d->kv_heads || !d->kv_capacity ||
+        !d->intermediate_width || d->selected_count == 0 ||
+        d->selected_count > G4_MAX_SELECTED || d->selected_count > d->expert_count ||
+        d->expert_count < 2 || d->expert_count > 256 ||
+        (d->expert_count & (d->expert_count - 1)) != 0)
+        return fail("unsupported Gemma layer geometry for the GPU path");
+    if (!q4_matrix_ok(d->query, query_width, d->model_width) ||
+        !q4_matrix_ok(d->key, kv_width, d->model_width) ||
+        !q4_matrix_ok(d->output, d->model_width, query_width) ||
+        (!d->key_equals_value && !q4_matrix_ok(d->value, kv_width, d->model_width)) ||
+        !q4_matrix_ok(d->gate, d->intermediate_width, d->model_width) ||
+        !q4_matrix_ok(d->up, d->intermediate_width, d->model_width) ||
+        !q4_matrix_ok(d->down, d->model_width, d->intermediate_width))
+        return fail("a layer matrix is not resident in VRAM as Q4_0");
+    if (!d->input_norm || !d->query_norm || !d->key_norm || !d->post_attention_norm ||
+        !d->ffn_norm || !d->post_ffw_norm_1 || !d->pre_ffw_norm_2 || !d->post_ffw_norm_2 ||
+        !d->post_ffw_norm || !d->router_input_scale || !d->router_projection ||
+        (d->rope_factors && d->rope_factor_count != d->head_dim / 2))
+        return fail("missing layer weights");
+    if (cudaSetDevice(g_ctx->device) != cudaSuccess) return fail("cannot select the CUDA device");
+    gemma4_gpu_layer *layer = static_cast<gemma4_gpu_layer *>(std::calloc(1, sizeof(*layer)));
+    if (!layer) return fail("out of memory");
+    layer->model_width = d->model_width; layer->query_heads = d->query_heads;
+    layer->kv_heads = d->kv_heads; layer->head_dim = d->head_dim;
+    layer->query_width = query_width; layer->kv_width = kv_width;
+    layer->capacity = d->kv_capacity; layer->intermediate = d->intermediate_width;
+    layer->experts = d->expert_count; layer->selected = d->selected_count;
+    layer->sliding = d->sliding; layer->key_equals_value = d->key_equals_value;
+    layer->epsilon = d->epsilon; layer->rope_base = d->rope_base;
+    layer->output_scale = d->layer_output_scale;
+    layer->query = static_cast<gemma4_cuda_matrix *>(d->query);
+    layer->key = static_cast<gemma4_cuda_matrix *>(d->key);
+    layer->value = static_cast<gemma4_cuda_matrix *>(d->value);
+    layer->output = static_cast<gemma4_cuda_matrix *>(d->output);
+    layer->gate = static_cast<gemma4_cuda_matrix *>(d->gate);
+    layer->up = static_cast<gemma4_cuda_matrix *>(d->up);
+    layer->down = static_cast<gemma4_cuda_matrix *>(d->down);
+    const size_t mw = d->model_width;
+    const float root_scale = 1.0F / std::sqrt(static_cast<float>(d->model_width));
+    layer->input_norm = upload_floats(d->input_norm, mw);
+    layer->query_norm = upload_floats(d->query_norm, d->head_dim);
+    layer->key_norm = upload_floats(d->key_norm, d->head_dim);
+    layer->rope_factors = d->rope_factors ? upload_floats(d->rope_factors, d->head_dim / 2) : nullptr;
+    layer->post_attention_norm = upload_floats(d->post_attention_norm, mw);
+    layer->ffn_norm = upload_floats(d->ffn_norm, mw);
+    layer->post_ffw_norm_1 = upload_floats(d->post_ffw_norm_1, mw);
+    layer->pre_ffw_norm_2 = upload_floats(d->pre_ffw_norm_2, mw);
+    layer->post_ffw_norm_2 = upload_floats(d->post_ffw_norm_2, mw);
+    layer->post_ffw_norm = upload_floats(d->post_ffw_norm, mw);
+    layer->router_scale = upload_floats(d->router_input_scale, mw, root_scale);
+    layer->router_projection = upload_floats(d->router_projection, mw * d->expert_count);
+    const bool small_ok = layer->input_norm && layer->query_norm && layer->key_norm &&
+        (!d->rope_factors || layer->rope_factors) && layer->post_attention_norm &&
+        layer->ffn_norm && layer->post_ffw_norm_1 && layer->pre_ffw_norm_2 &&
+        layer->post_ffw_norm_2 && layer->post_ffw_norm && layer->router_scale &&
+        layer->router_projection;
+    const size_t cache_bytes = static_cast<size_t>(d->kv_capacity) * kv_width * sizeof(float);
+    if (!small_ok || cudaMalloc(&layer->key_cache, cache_bytes) != cudaSuccess ||
+        cudaMalloc(&layer->value_cache, cache_bytes) != cudaSuccess ||
+        !scratch_reserve(d->model_width, query_width, kv_width, d->intermediate_width,
+                         d->expert_count, static_cast<size_t>(d->query_heads) * d->kv_capacity)) {
+        cudaGetLastError();
+        layer_free(layer);
+        return fail("not enough VRAM for the device layer (KV cache or scratch)");
+    }
+    return layer;
+}
+
+extern "C" void coli_gemma4_cuda_layer_destroy(void *opaque) {
+    if (g_ctx) cudaSetDevice(g_ctx->device);
+    layer_free(static_cast<gemma4_gpu_layer *>(opaque));
+}
+
+static void launch_matvec(const gemma4_cuda_matrix *m, const float *input, float *output) {
+    q4_0_matvec<<<grid_for(m->rows), kWarpsPerBlock * 32U>>>(
+        m->data, m->rows, m->columns, input, 1.0F, 0.0F, output);
+}
+
+extern "C" int coli_gemma4_cuda_layer_kv_store(void *opaque, uint32_t slot,
+                                                const float *key, const float *value) {
+    gemma4_gpu_layer *layer = static_cast<gemma4_gpu_layer *>(opaque);
+    if (!layer || !g_ctx || slot >= layer->capacity) return -1;
+    const size_t bytes = static_cast<size_t>(layer->kv_width) * sizeof(float);
+    if (cudaSetDevice(g_ctx->device) != cudaSuccess ||
+        cudaMemcpy(layer->key_cache + static_cast<size_t>(slot) * layer->kv_width, key, bytes,
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(layer->value_cache + static_cast<size_t>(slot) * layer->kv_width, value,
+                   bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int coli_gemma4_cuda_layer_attend(
+    void *opaque, uint64_t position, uint64_t first_position, uint32_t history_count,
+    const float *residual, uint32_t *ids, float *weights, float *key, float *value) {
+    gemma4_gpu_layer *L = static_cast<gemma4_gpu_layer *>(opaque);
+    gemma4_cuda_context *ctx = g_ctx;
+    gemma4_gpu_scratch &S = g_scratch;
+    if (!L || !ctx || !residual || !ids || !weights || !key || !value || !history_count ||
+        history_count > L->capacity || position > 0x7FFFFFFFULL) return -2;
+    if (!L->sliding && position >= L->capacity) return -2;
+    if (!ctx->configured) return -2;
+    ensure_slab(ctx);
+    if (!ctx->slots || !S.res) return -2;
+    if (cudaSetDevice(ctx->device) != cudaSuccess) return -1;
+    const int mw = static_cast<int>(L->model_width), hd = static_cast<int>(L->head_dim);
+    const int slot = L->sliding ? static_cast<int>(position % L->capacity)
+                                : static_cast<int>(position);
+    cudaError_t result = cudaMemcpyAsync(S.res, residual, sizeof(float) * mw,
+                                         cudaMemcpyHostToDevice, 0);
+    if (result != cudaSuccess) { cudaGetLastError(); return -1; }
+    k_rms_norm<<<1, 256>>>(S.res, L->input_norm, nullptr, S.norm, mw, L->epsilon, 1.0F);
+    launch_matvec(L->query, S.norm, S.q);
+    launch_matvec(L->key, S.norm, S.k);
+    if (L->key_equals_value)
+        cudaMemcpyAsync(S.v, S.k, sizeof(float) * L->kv_width, cudaMemcpyDeviceToDevice, 0);
+    else
+        launch_matvec(L->value, S.norm, S.v);
+    k_rms_norm<<<L->query_heads, 256>>>(S.q, L->query_norm, nullptr, S.q, hd, L->epsilon, 1.0F);
+    k_rms_norm<<<L->kv_heads, 256>>>(S.k, L->key_norm, nullptr, S.k, hd, L->epsilon, 1.0F);
+    k_rms_norm<<<L->kv_heads, 256>>>(S.v, nullptr, nullptr, S.v, hd, L->epsilon, 1.0F);
+    k_rope_neox<<<(L->query_heads * (hd / 2) + 127) / 128, 128>>>(
+        S.q, L->query_heads, hd, static_cast<int>(position), L->rope_base, L->rope_factors);
+    k_rope_neox<<<(L->kv_heads * (hd / 2) + 127) / 128, 128>>>(
+        S.k, L->kv_heads, hd, static_cast<int>(position), L->rope_base, L->rope_factors);
+    k_kv_store<<<(L->kv_width + 255) / 256, 256>>>(
+        L->key_cache, L->value_cache, slot, S.k, S.v, static_cast<int>(L->kv_width), S.kv_export);
+    k_attention<<<L->query_heads, 256>>>(
+        S.q, L->key_cache, L->value_cache, S.context, S.scores, hd,
+        static_cast<int>(L->query_heads / L->kv_heads), static_cast<int>(L->kv_width),
+        static_cast<int>(L->capacity), L->sliding, first_position,
+        static_cast<int>(history_count), static_cast<int>(L->capacity));
+    launch_matvec(L->output, S.context, S.attn);
+    k_rms_norm<<<1, 256>>>(S.attn, L->post_attention_norm, S.res, S.after, mw, L->epsilon, 1.0F);
+    k_rms_norm<<<1, 256>>>(S.after, L->ffn_norm, nullptr, S.dense_in, mw, L->epsilon, 1.0F);
+    k_rms_norm<<<1, 256>>>(S.after, L->router_scale, nullptr, S.router_norm, mw, L->epsilon, 1.0F);
+    k_router_logits<<<L->experts, 128>>>(L->router_projection, S.router_norm, mw, S.router_logits);
+#define G4_TOPK(N) case N: k_topk_softmax<N><<<1, 32>>>(S.router_logits, S.router_weights, \
+        S.router_ids, L->selected, 0.0F); break;
+    switch (L->experts) {
+    G4_TOPK(2) G4_TOPK(4) G4_TOPK(8) G4_TOPK(16) G4_TOPK(32) G4_TOPK(64) G4_TOPK(128)
+    default: k_topk_softmax<256><<<1, 32>>>(S.router_logits, S.router_weights,
+                                            S.router_ids, L->selected, 0.0F); break;
+    }
+#undef G4_TOPK
+    k_rms_norm<<<1, 256>>>(S.after, L->pre_ffw_norm_2, nullptr, ctx->ex_in, mw, L->epsilon, 1.0F);
+    result = cudaGetLastError();
+    if (result == cudaSuccess)
+        result = cudaMemcpyAsync(S.host_ids, S.router_ids, sizeof(int32_t) * L->selected,
+                                 cudaMemcpyDeviceToHost, 0);
+    if (result == cudaSuccess)
+        result = cudaMemcpyAsync(S.host_weights, S.router_weights, sizeof(float) * L->selected,
+                                 cudaMemcpyDeviceToHost, 0);
+    if (result == cudaSuccess)
+        result = cudaMemcpyAsync(S.host_kv, S.kv_export, sizeof(float) * 2 * L->kv_width,
+                                 cudaMemcpyDeviceToHost, 0);
+    if (result == cudaSuccess) result = cudaStreamSynchronize(0);
+    if (result != cudaSuccess) {
+        set_error(nullptr, 0, "device attention failed", result);
+        return -1;
+    }
+    for (uint32_t i = 0; i < L->selected; ++i) {
+        if (S.host_ids[i] < 0 || static_cast<uint32_t>(S.host_ids[i]) >= L->experts) {
+            std::snprintf(g_error, sizeof(g_error), "device router produced an invalid expert id");
+            return -1;
+        }
+        ids[i] = static_cast<uint32_t>(S.host_ids[i]);
+        weights[i] = S.host_weights[i];
+    }
+    std::memcpy(key, S.host_kv, sizeof(float) * L->kv_width);
+    std::memcpy(value, S.host_kv + L->kv_width, sizeof(float) * L->kv_width);
+    return 0;
+}
+
+extern "C" int coli_gemma4_cuda_layer_dense(void *opaque) {
+    gemma4_gpu_layer *L = static_cast<gemma4_gpu_layer *>(opaque);
+    gemma4_gpu_scratch &S = g_scratch;
+    if (!L || !g_ctx) return -1;
+    const int mw = static_cast<int>(L->model_width), inter = static_cast<int>(L->intermediate);
+    launch_matvec(L->gate, S.dense_in, S.hidden_gate);
+    launch_matvec(L->up, S.dense_in, S.hidden_up);
+    k_gelu_mul<<<(inter + 255) / 256, 256>>>(S.hidden_gate, S.hidden_up, inter, S.hidden);
+    launch_matvec(L->down, S.hidden, S.dense_out);
+    k_rms_norm<<<1, 256>>>(S.dense_out, L->post_ffw_norm_1, nullptr, S.dense_norm, mw,
+                           L->epsilon, 1.0F);
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess) {
+        set_error(nullptr, 0, "device dense MLP failed", result);
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int coli_gemma4_cuda_layer_complete(void *opaque, float *output) {
+    gemma4_gpu_layer *L = static_cast<gemma4_gpu_layer *>(opaque);
+    gemma4_cuda_context *ctx = g_ctx;
+    gemma4_gpu_scratch &S = g_scratch;
+    if (!L || !ctx || !output) return -1;
+    const int mw = static_cast<int>(L->model_width);
+    k_rms_norm<<<1, 256>>>(ctx->ex_out, L->post_ffw_norm_2, S.dense_norm, S.combined, mw,
+                           L->epsilon, 1.0F);
+    k_rms_norm<<<1, 256>>>(S.combined, L->post_ffw_norm, S.after, S.out, mw, L->epsilon,
+                           L->output_scale);
+    cudaError_t result = cudaGetLastError();
+    if (result == cudaSuccess)
+        result = cudaMemcpy(output, S.out, sizeof(float) * mw, cudaMemcpyDeviceToHost);
+    if (result != cudaSuccess) {
+        set_error(nullptr, 0, "device layer finish failed", result);
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int coli_gemma4_cuda_layer_begin_resident(void *opaque, char *error,
+                                                      size_t error_capacity) {
+    gemma4_cuda_context *context = static_cast<gemma4_cuda_context *>(opaque);
+    if (!context || !context->configured) return -1;
+    ensure_slab(context);
+    if (!context->slots) return -1;
+    cudaError_t result = cudaSetDevice(context->device);
+    if (result == cudaSuccess) {
+        clear_floats<<<(context->model_width + 255U) / 256U, 256>>>(context->ex_out,
+                                                                    context->model_width);
+        result = cudaGetLastError();
+    }
+    if (result != cudaSuccess) {
+        set_error(error, error_capacity, "CUDA layer begin failed", result);
+        return -1;
+    }
+    return 0;
 }

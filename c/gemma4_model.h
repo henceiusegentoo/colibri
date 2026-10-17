@@ -55,6 +55,7 @@ typedef struct {
     uint64_t *positions;
     float *keys;
     float *values;
+    void *gpu;                  /* device mirror (gemma4_cuda layer) or NULL */
 } coli_gemma4_kv_cache;
 
 typedef struct {
@@ -82,6 +83,7 @@ typedef struct {
     float *post_ffw_norm_2;
     float *post_ffw_norm;
     float layer_output_scale;
+    void *gpu;                  /* whole-layer CUDA decode state, or NULL */
     char last_error[COLI_GEMMA4_GGUF_ERROR_MAX];
 } coli_gemma4_decoder_layer;
 
@@ -199,6 +201,10 @@ int coli_gemma4_decoder_layer_noncausal(
     const float *residuals, uint32_t token_count, float *outputs);
 
 /* Wall seconds spent in attention vs. the rest of the layer (dense MLP, router, experts). */
+/* Layer steps run entirely on the GPU vs. on the CPU path. */
+/* Seconds in the GPU path stages: attend, prepare_layer, dense, experts, complete. */
+void coli_gemma4_model_stage_times(double out[5]);
+void coli_gemma4_model_layer_counts(unsigned long long *gpu, unsigned long long *cpu);
 void coli_gemma4_model_profile(double *attention_seconds, double *complete_seconds);
 
 int coli_gemma4_router_open(coli_gemma4_router *router,

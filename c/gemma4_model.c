@@ -237,6 +237,9 @@ static void model_error(coli_gemma4_model *model, const char *format, ...) {
     va_end(arguments);
 }
 
+static void decoder_gpu_attach(coli_gemma4_decoder_layer *decoder,
+                               coli_gemma4_kv_cache *cache);
+
 int coli_gemma4_model_open(coli_gemma4_model *model,
                            const coli_gemma4_gguf *gguf,
                            const coli_expert_backend *experts,
@@ -279,6 +282,7 @@ int coli_gemma4_model_open(coli_gemma4_model *model,
             model_error(model, "layer %u: cannot allocate KV cache", layer);
             goto fail;
         }
+        decoder_gpu_attach(&model->layers[layer], &model->caches[layer]);
     }
     return 0;
 
@@ -741,8 +745,10 @@ void coli_gemma4_kv_cache_close(coli_gemma4_kv_cache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
-int coli_gemma4_kv_cache_store(coli_gemma4_kv_cache *cache, uint64_t position,
-                               const float *key, const float *value) {
+/* Writes the host copy only. Returns the slot through *slot_out. */
+static int kv_cache_store_host(coli_gemma4_kv_cache *cache, uint64_t position,
+                               const float *key, const float *value,
+                               uint64_t *slot_out) {
     uint64_t slot;
     if (!cache || !cache->capacity || !key || !value) return -1;
     if (cache->sliding) slot = position % cache->capacity;
@@ -757,6 +763,19 @@ int coli_gemma4_kv_cache_store(coli_gemma4_kv_cache *cache, uint64_t position,
     if (cache->positions[slot] == UINT64_MAX && cache->count < cache->capacity)
         ++cache->count;
     cache->positions[slot] = position;
+    if (slot_out) *slot_out = slot;
+    return 0;
+}
+
+/* Host cache write that also keeps the device mirror in step, so any writer (CPU
+ * attention, the vision path) leaves host and device identical. */
+int coli_gemma4_kv_cache_store(coli_gemma4_kv_cache *cache, uint64_t position,
+                               const float *key, const float *value) {
+    uint64_t slot = 0;
+    if (kv_cache_store_host(cache, position, key, value, &slot) != 0) return -1;
+    if (cache->gpu &&
+        coli_gemma4_cuda_layer_kv_store(cache->gpu, (uint32_t)slot, key, value) != 0)
+        return -1;
     return 0;
 }
 
@@ -1168,6 +1187,7 @@ fail:
 
 void coli_gemma4_decoder_layer_close(coli_gemma4_decoder_layer *decoder) {
     if (!decoder) return;
+    coli_gemma4_cuda_layer_destroy(decoder->gpu);
     coli_gemma4_attention_close(&decoder->attention);
     coli_gemma4_router_close(&decoder->router);
     coli_gemma4_dense_mlp_close(&decoder->dense_mlp);
@@ -1271,7 +1291,149 @@ cleanup:
     return status;
 }
 
+/* ---- whole-layer decode on the GPU --------------------------------------------- */
+
+static double g_stage_attend, g_stage_prepare, g_stage_dense, g_stage_experts, g_stage_complete;
+static double profile_now(void);
+
+static int matrix_resident_q4(const coli_gemma4_matrix *matrix) {
+    return matrix && matrix->cuda && matrix->tensor &&
+           matrix->tensor->type == COLI_GGML_TYPE_Q4_0;
+}
+
+/* Builds the device layer for one decoder layer when every matrix is resident in VRAM.
+ * Anything missing (not enough VRAM, GEMMA4_CUDA_ATTN=0, unsupported geometry) just
+ * leaves decoder->gpu NULL, and that layer keeps running on the CPU path. */
+static void decoder_gpu_attach(coli_gemma4_decoder_layer *decoder,
+                               coli_gemma4_kv_cache *cache) {
+    const coli_gemma4_attention *a = &decoder->attention;
+    coli_gemma4_cuda_layer_desc desc;
+    const char *off = getenv("GEMMA4_CUDA_ATTN");
+    char error[256];
+    if ((off && off[0] == '0') || !coli_gemma4_cuda_dense_enabled()) return;
+    if (!matrix_resident_q4(&a->query) || !matrix_resident_q4(&a->key) ||
+        !matrix_resident_q4(&a->output) ||
+        (!a->key_equals_value && !matrix_resident_q4(&a->value)) ||
+        !matrix_resident_q4(&decoder->dense_mlp.gate) ||
+        !matrix_resident_q4(&decoder->dense_mlp.up) ||
+        !matrix_resident_q4(&decoder->dense_mlp.down)) return;
+    memset(&desc, 0, sizeof(desc));
+    desc.model_width = decoder->model_width;
+    desc.query_heads = a->query_heads;
+    desc.kv_heads = a->kv_heads;
+    desc.head_dim = a->head_dim;
+    desc.kv_capacity = cache->capacity;
+    desc.intermediate_width = decoder->dense_mlp.intermediate_width;
+    desc.expert_count = decoder->router.expert_count;
+    desc.selected_count = decoder->router.selected_count;
+    desc.sliding = a->sliding;
+    desc.key_equals_value = a->key_equals_value;
+    desc.epsilon = decoder->gguf->rms_epsilon;
+    desc.rope_base = a->sliding ? decoder->gguf->rope_freq_base_swa
+                                : decoder->gguf->rope_freq_base;
+    desc.layer_output_scale = decoder->layer_output_scale;
+    desc.query = a->query.cuda;
+    desc.key = a->key.cuda;
+    desc.value = a->value.cuda;
+    desc.output = a->output.cuda;
+    desc.gate = decoder->dense_mlp.gate.cuda;
+    desc.up = decoder->dense_mlp.up.cuda;
+    desc.down = decoder->dense_mlp.down.cuda;
+    desc.input_norm = a->input_norm;
+    desc.query_norm = a->query_norm;
+    desc.key_norm = a->key_norm;
+    desc.rope_factors = a->rope_factors;
+    desc.rope_factor_count = a->rope_factor_count;
+    desc.post_attention_norm = decoder->post_attention_norm;
+    desc.ffn_norm = decoder->ffn_norm;
+    desc.post_ffw_norm_1 = decoder->post_ffw_norm_1;
+    desc.pre_ffw_norm_2 = decoder->pre_ffw_norm_2;
+    desc.post_ffw_norm_2 = decoder->post_ffw_norm_2;
+    desc.post_ffw_norm = decoder->post_ffw_norm;
+    desc.router_input_scale = decoder->router.input_scale;
+    desc.router_projection = decoder->router.projection;
+    decoder->gpu = coli_gemma4_cuda_layer_create(&desc, error, sizeof(error));
+    if (decoder->gpu) {
+        /* Seed the device KV mirror from whatever the host cache already holds. */
+        uint32_t slot;
+        for (slot = 0; slot < cache->capacity; ++slot)
+            if (cache->positions[slot] != UINT64_MAX)
+                (void)coli_gemma4_cuda_layer_kv_store(
+                    decoder->gpu, slot, cache->keys + (size_t)slot * cache->kv_width,
+                    cache->values + (size_t)slot * cache->kv_width);
+        cache->gpu = decoder->gpu;
+    }
+}
+
+/* 0 = layer done on the GPU; -2 = not possible right now, nothing was changed, the
+ * caller runs the CPU path; -1 = hard error. */
+static int decoder_gpu_step(const coli_gemma4_decoder_layer *decoder,
+                            coli_gemma4_kv_cache *cache,
+                            const coli_expert_backend *experts, uint64_t position,
+                            const float *residual, float *output) {
+    uint32_t ids[32];
+    float weights[32];
+    float *kv = NULL;
+    double t[6];
+    uint64_t first = 0, p;
+    uint32_t history, selected = decoder->router.selected_count, kv_width = cache->kv_width;
+    int status;
+    if (!decoder->gpu || cache->gpu != decoder->gpu || !experts->run_experts_device ||
+        selected > 32 || cache->sliding != decoder->attention.sliding) return -2;
+    if (cache->sliding && position >= cache->capacity) first = position - cache->capacity + 1;
+    if (!cache->sliding && position >= cache->capacity) return -2;
+    history = (uint32_t)(position - first + 1);
+    /* Every earlier position in the window must be present, exactly as the CPU path
+     * requires; otherwise let it report the problem. */
+    for (p = first; p < position; ++p) {
+        uint64_t slot = cache->sliding ? p % cache->capacity : p;
+        if (cache->positions[slot] != p) return -2;
+    }
+    kv = (float *)malloc((size_t)kv_width * 2 * sizeof(float));
+    if (!kv) return -1;
+    t[0] = profile_now();
+    status = coli_gemma4_cuda_layer_attend(decoder->gpu, position, first, history,
+                                           residual, ids, weights, kv, kv + kv_width);
+    if (status != 0) { free(kv); return status; }
+    if (kv_cache_store_host(cache, position, kv, kv + kv_width, NULL) != 0) {
+        free(kv);
+        return -1;
+    }
+    free(kv);
+    t[1] = profile_now();
+    if (experts->prepare_layer(experts->ctx, decoder->layer, ids, selected) != 0) return -1;
+    t[2] = profile_now();
+    status = coli_gemma4_cuda_layer_dense(decoder->gpu);
+    t[3] = profile_now();
+    if (status == 0) {
+        status = experts->run_experts_device(experts->ctx, decoder->layer, ids, weights,
+                                             selected);
+        if (status == -2) status = -1;   /* the cache was verified active before attend */
+    }
+    t[4] = profile_now();
+    experts->release_layer(experts->ctx, decoder->layer);
+    if (status != 0) return -1;
+    status = coli_gemma4_cuda_layer_complete(decoder->gpu, output) == 0 ? 0 : -1;
+    t[5] = profile_now();
+    g_stage_attend += t[1] - t[0]; g_stage_prepare += t[2] - t[1];
+    g_stage_dense += t[3] - t[2]; g_stage_experts += t[4] - t[3];
+    g_stage_complete += t[5] - t[4];
+    return status;
+}
+
 static double g_profile_attention, g_profile_complete;
+static unsigned long long g_gpu_layer_steps, g_cpu_layer_steps;
+
+
+void coli_gemma4_model_stage_times(double out[5]) {
+    out[0] = g_stage_attend; out[1] = g_stage_prepare; out[2] = g_stage_dense;
+    out[3] = g_stage_experts; out[4] = g_stage_complete;
+}
+
+void coli_gemma4_model_layer_counts(unsigned long long *gpu, unsigned long long *cpu) {
+    if (gpu) *gpu = g_gpu_layer_steps;
+    if (cpu) *cpu = g_cpu_layer_steps;
+}
 
 void coli_gemma4_model_profile(double *attention_seconds, double *complete_seconds) {
     if (attention_seconds) *attention_seconds = g_profile_attention;
@@ -1301,6 +1463,16 @@ int coli_gemma4_decoder_layer_step(
     int status;
     if (!decoder || !cache || !experts || !residual || !output ||
         !decoder->model_width) return -1;
+    if (decoder->gpu) {
+        t0 = profile_now();
+        status = decoder_gpu_step(decoder, cache, experts, position, residual, output);
+        g_profile_complete += profile_now() - t0;
+        if (status != -2) {
+            if (status == 0) ++g_gpu_layer_steps;
+            return status == 0 ? 0 : -1;
+        }
+    }
+    ++g_cpu_layer_steps;
     vector_bytes = (size_t)decoder->model_width * sizeof(float);
     attention_output = (float *)malloc(vector_bytes);
     if (!attention_output) return -1;

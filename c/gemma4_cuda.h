@@ -68,6 +68,47 @@ void coli_gemma4_cuda_expert_cache_stats(
     void *context, uint32_t *slots, uint32_t *resident, uint64_t *hits,
     uint64_t *misses, uint64_t *evictions);
 
+/* ---- whole-layer decode on the GPU (one token) ----------------------------
+ * Stage 1 (attend): input norm, Q/K/V, QK norm, RoPE, KV append, attention, output
+ *   projection, post-attention norm + residual, FFN norm, router softmax + top-k and
+ *   the expert-input norm, all on the device. Only the selected expert ids/weights
+ *   and the new token's K/V (so the host cache stays an exact mirror) come back.
+ * Stage 2 (dense + experts + complete): the dense MLP and the VRAM-resident experts run
+ *   while missed experts stream in, then the post-norms, combine and layer scale, and
+ *   one download of the layer output.
+ * Every matrix must be a resident Q4_0 matrix (uploaded with matrix_upload); the
+ * device KV cache is a mirror of the host cache: host writes go through kv_store.   */
+typedef struct {
+    uint32_t model_width, query_heads, kv_heads, head_dim, kv_capacity;
+    uint32_t intermediate_width, expert_count, selected_count;
+    int sliding, key_equals_value;
+    float epsilon, rope_base, layer_output_scale;
+    void *query, *key, *value, *output, *gate, *up, *down;   /* value may be NULL */
+    const float *input_norm, *query_norm, *key_norm, *rope_factors; /* factors may be NULL */
+    uint32_t rope_factor_count;
+    const float *post_attention_norm, *ffn_norm, *post_ffw_norm_1, *pre_ffw_norm_2,
+                *post_ffw_norm_2, *post_ffw_norm;
+    const float *router_input_scale, *router_projection;     /* projection: experts x width */
+} coli_gemma4_cuda_layer_desc;
+
+void *coli_gemma4_cuda_layer_create(const coli_gemma4_cuda_layer_desc *desc,
+                                    char *error, size_t error_capacity);
+void coli_gemma4_cuda_layer_destroy(void *layer);
+/* 0 = done; -2 = GPU path unavailable right now (nothing was modified, use the CPU
+ * path); -1 = hard error. key/value receive kv_heads * head_dim floats each. */
+int coli_gemma4_cuda_layer_attend(void *layer, uint64_t position,
+                                  uint64_t first_position, uint32_t history_count,
+                                  const float *residual, uint32_t *ids, float *weights,
+                                  float *key, float *value);
+int coli_gemma4_cuda_layer_kv_store(void *layer, uint32_t slot,
+                                    const float *key, const float *value);
+int coli_gemma4_cuda_layer_dense(void *layer);
+int coli_gemma4_cuda_layer_complete(void *layer, float *output);
+/* Expert accumulation for a layer whose input is already on the device (written by
+ * attend): clears the accumulator only. No upload, and no download at the end. */
+int coli_gemma4_cuda_layer_begin_resident(void *context, char *error,
+                                          size_t error_capacity);
+
 #ifdef __cplusplus
 }
 #endif

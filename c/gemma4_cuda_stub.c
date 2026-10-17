@@ -108,3 +108,41 @@ void coli_gemma4_cuda_expert_cache_stats(
 void *coli_gemma4_cuda_host_alloc(size_t bytes) { return malloc(bytes); }
 
 void coli_gemma4_cuda_host_free(void *pointer) { free(pointer); }
+
+void *coli_gemma4_cuda_layer_create(const coli_gemma4_cuda_layer_desc *desc,
+                                    char *error, size_t error_capacity) {
+    (void)desc;
+    not_built(error, error_capacity);
+    return NULL;
+}
+
+void coli_gemma4_cuda_layer_destroy(void *layer) { (void)layer; }
+
+int coli_gemma4_cuda_layer_attend(void *layer, uint64_t position,
+                                  uint64_t first_position, uint32_t history_count,
+                                  const float *residual, uint32_t *ids, float *weights,
+                                  float *key, float *value) {
+    (void)layer; (void)position; (void)first_position; (void)history_count;
+    (void)residual; (void)ids; (void)weights; (void)key; (void)value;
+    return -2;
+}
+
+int coli_gemma4_cuda_layer_kv_store(void *layer, uint32_t slot,
+                                    const float *key, const float *value) {
+    (void)layer; (void)slot; (void)key; (void)value;
+    return 0;
+}
+
+int coli_gemma4_cuda_layer_dense(void *layer) { (void)layer; return -1; }
+
+int coli_gemma4_cuda_layer_complete(void *layer, float *output) {
+    (void)layer; (void)output;
+    return -1;
+}
+
+int coli_gemma4_cuda_layer_begin_resident(void *context, char *error,
+                                          size_t error_capacity) {
+    (void)context;
+    not_built(error, error_capacity);
+    return -1;
+}

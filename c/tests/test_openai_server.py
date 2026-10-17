@@ -2854,3 +2854,35 @@ class ContextExceededMessageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultModelTest(unittest.TestCase):
+    """COLI_DEFAULT_MODEL=1 lets a request omit `model`; a wrong name is still refused."""
+
+    class _Server:
+        model_id = "served-model"
+
+    def check(self, body, env):
+        handler = APIHandler.__new__(APIHandler)
+        handler.server = self._Server()
+        with patch.dict(os.environ, env, clear=False):
+            APIHandler.check_model(handler, body)
+
+    def test_missing_model_is_refused_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COLI_DEFAULT_MODEL", None)
+            with self.assertRaises(APIError) as caught:
+                self.check({"messages": []}, {})
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_missing_or_null_model_uses_the_served_model_when_enabled(self):
+        for body in ({"messages": []}, {"model": None, "messages": []}):
+            self.check(body, {"COLI_DEFAULT_MODEL": "1"})
+            self.assertEqual(body["model"], "served-model")
+
+    def test_wrong_model_is_still_refused_when_enabled(self):
+        with self.assertRaises(APIError):
+            self.check({"model": "other"}, {"COLI_DEFAULT_MODEL": "1"})
+
+    def test_matching_model_passes(self):
+        self.check({"model": "served-model"}, {})

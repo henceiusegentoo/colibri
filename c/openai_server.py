@@ -3905,6 +3905,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def check_model(self, body):
         model = body.get("model")
+        # COLI_DEFAULT_MODEL=1: a request that names no model (field absent or null) is
+        # served by the one model this gateway runs. A model name that is given must
+        # still match.
+        if model is None and os.environ.get("COLI_DEFAULT_MODEL") == "1":
+            body["model"] = model = self.server.model_id
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 

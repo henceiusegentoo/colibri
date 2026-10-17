@@ -2207,6 +2207,19 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	  echo "web/dist absent -- skipping the dashboard (build it with: cd web && npm run build)"; \
 	fi
 
+# Minimal install for a Gemma 4 deployment (the Dockerfile uses this): the launcher and
+# gateway, the gemma4 engine and the Python modules `coli` imports. The other engines are
+# not built or installed, and a CUDA=1 gemma4 build keeps its GPU tier.
+install-gemma4: gemma4$(EXE)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
+	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+	$(INSTALL) -m 755 gemma4$(EXE) $(DESTDIR)$(LIBEXECDIR)/gemma4$(EXE)
+	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
+		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
+
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli
 	rm -rf $(DESTDIR)$(LIBEXECDIR)
@@ -2216,7 +2229,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+.PHONY: install-gemma4 all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
@@ -2232,3 +2245,5 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+
+.PHONY: install-gemma4

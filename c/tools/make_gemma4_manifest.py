@@ -9,6 +9,8 @@ the second form, so no separate packing step is needed:
     python3 tools/make_gemma4_manifest.py MODEL.gguf OUT_DIR
     ./gemma4 generate MODEL.gguf OUT_DIR "Hello" --max-new 16
 
+The manifest stores the GGUF path relative to OUT_DIR (e.g. ../model.gguf) when it can.
+
 Only the GGUF header and tensor directory are read. The expert tensors must be
 Q4_0 (the engine's only routed-expert format), laid out as the fused
 `ffn_gate_up_exps` ([model_width, 2 * expert_width, experts]) plus
@@ -16,6 +18,7 @@ Q4_0 (the engine's only routed-expert format), laid out as the fused
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -96,7 +99,21 @@ def read_directory(path):
     return kv, tensors, data_start
 
 
-def build(model):
+def source_reference(model, out_dir):
+    """Path the engine uses to find the GGUF. Relative to the manifest directory when
+    both live on one filesystem tree (the usual `model.gguf` next to `packed/`), so the
+    model directory can be mounted anywhere, e.g. into a container; otherwise absolute.
+    The model path is NOT resolved: a symlinked model.gguf stays a stable name."""
+    model_abs = os.path.abspath(model)
+    if out_dir is None:
+        return model_abs
+    try:
+        return os.path.relpath(model_abs, os.path.abspath(out_dir))
+    except ValueError:      # different drives on Windows
+        return model_abs
+
+
+def build(model, out_dir=None):
     kv, tensors, data_start = read_directory(model)
     if kv.get("general.architecture") != "gemma4":
         raise ValueError(f"architecture is {kv.get('general.architecture')!r}, not gemma4")
@@ -152,7 +169,7 @@ def build(model):
                                      "scalar_bytes": 4}
         layers.append(entry)
     return {"format": "g4lab-expert-manifest-v2", "architecture": "gemma4",
-            "source": str(Path(model).resolve()), "expert_count": experts,
+            "source": source_reference(model, out_dir), "expert_count": experts,
             "expert_used_count": used, "layers": layers}
 
 
@@ -162,7 +179,7 @@ def main():
     parser.add_argument("out", type=Path, help="directory that will hold manifest.json")
     args = parser.parse_args()
     try:
-        manifest = build(args.model)
+        manifest = build(args.model, args.out)
     except (OSError, ValueError, KeyError) as error:
         sys.exit(f"error: {error}")
     args.out.mkdir(parents=True, exist_ok=True)

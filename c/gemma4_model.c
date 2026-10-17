@@ -79,12 +79,20 @@ int coli_gemma4_matrix_open(coli_gemma4_matrix *matrix,
     /* With a CUDA context active, keep a resident VRAM copy for matvec. The host copy
      * stays (embedding rows are still read on the CPU) and is the fallback if the
      * upload does not fit. */
-    if (coli_gemma4_cuda_dense_enabled())
+    if (coli_gemma4_cuda_dense_enabled()) {
+        static int reported;
         matrix->cuda = coli_gemma4_cuda_matrix_upload(
             matrix->data, (size_t)tensor->nbytes,
             tensor->type == COLI_GGML_TYPE_Q6_K ? COLI_GEMMA4_CUDA_Q6_K
                                                  : COLI_GEMMA4_CUDA_Q4_0,
             matrix->output_width, matrix->input_width);
+        if (!matrix->cuda && !reported) {
+            /* Not fatal (this matrix stays on the CPU), but never silent. */
+            reported = 1;
+            fprintf(stderr, "gemma4 cuda: %s stays on the CPU: %s\n", name,
+                    coli_gemma4_cuda_last_error());
+        }
+    }
     return 0;
 }
 

@@ -349,9 +349,11 @@ extern "C" void *coli_gemma4_cuda_matrix_upload(const uint8_t *data, size_t byte
     const size_t block_bytes = type == COLI_GEMMA4_CUDA_Q6_K ? 210U : 18U;
     if (columns % block_elems ||
         bytes != static_cast<size_t>(rows) * (columns / block_elems) * block_bytes) return nullptr;
-    if (cudaSetDevice(g_ctx->device) != cudaSuccess) return nullptr;
+    cudaError_t probe = cudaSetDevice(g_ctx->device);
+    if (probe != cudaSuccess) { set_error(nullptr, 0, "cudaSetDevice", probe); return nullptr; }
     size_t free_bytes = 0, total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return nullptr;
+    probe = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (probe != cudaSuccess) { set_error(nullptr, 0, "cudaMemGetInfo", probe); return nullptr; }
     /* Dense weights are needed by every token, so they are uploaded first and may use
      * everything except the safety reserve; the expert slab takes what is left. */
     const size_t reserve_bytes = env_mb("GEMMA4_CUDA_RESERVE_MB", 256);
